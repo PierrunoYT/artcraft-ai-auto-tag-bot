@@ -30,9 +30,11 @@ as applicable. Discord's age and eligibility requirements apply.
 
 ## Automated changes and limitations
 
-**The bot can replace all applied tags, including tags added manually by members
-or moderators.** A valid empty AI selection can remove all tags. AI classifications
-may be inaccurate. Administrators are responsible for reviewing results and
+By default the bot adds tags and keeps those already applied. **If the operator
+enables replace mode, the bot replaces member-selectable tags, including tags added
+manually by members or moderators,** and a valid empty AI selection can remove them.
+The bot never applies or removes moderator-only tags. AI classifications may be
+inaccurate. Administrators are responsible for reviewing results and
 correcting mistakes; the bot is not a substitute for human moderation.
 
 The bot uses only tags already defined in the configured forums. Archived and

@@ -1,16 +1,18 @@
 # ArtCraft AI Auto-Tag Bot
 
 A Python 3.12+ Discord bot that classifies new posts in selected forum channels
-using OpenRouter. Default model: **`openai/gpt-4.1-mini`**.
+using OpenRouter. Default model: **`openai/gpt-6-luna`**.
 
 [Terms of Service](TERMS_OF_SERVICE.md) · [Privacy Policy](PRIVACY_POLICY.md)
 
 - Uses existing forum tags only; never creates tags.
-- Replaces the entire applied tag set with the AI selection, adding and removing
-  tags as needed. Manual and moderator-only tags are not protected.
+- By default adds AI-selected tags and keeps the tags already applied. Set
+  `TAG_MODE=replace` to replace member-selectable tags with the AI selection instead.
+- Never applies or removes moderator-only tags.
 - Enforces OpenRouter zero-data-retention routing on every request.
 - No database, message files, or message-content logs; Discord message caching is disabled.
-- Moderator-only slash commands for one thread or a batch of active threads.
+- Slash commands for one thread or a batch of active threads, limited to an allowlist
+  of Discord user IDs.
 
 ## Setup
 
@@ -65,24 +67,35 @@ and use URLs for your own deployment. See also the official
 | `DISCORD_TOKEN` | Yes | Discord bot token |
 | `OPENROUTER_API_KEY` | Yes | OpenRouter API key with credits |
 | `FORUM_CHANNEL_IDS` | Yes | Comma-separated forum IDs; no other forums are processed |
-| `OPENROUTER_MODEL` | No | `openai/gpt-4.1-mini` |
-| `MAX_AI_TAGS` | No | `3`, from 1 to 5; maximum tags in the replacement set |
+| `OPENROUTER_MODEL` | No | `openai/gpt-6-luna` |
+| `MAX_AI_TAGS` | No | `3`, from 1 to 5; maximum tags the AI may choose |
+| `TAG_MODE` | No | `add` (keep existing tags) or `replace` (replace member-selectable tags) |
+| `COMMAND_USER_IDS` | No | Comma-separated user IDs allowed to run `/autotag`; empty disables the commands |
 
+The default model is served through a ZDR endpoint with structured outputs.
 Replacement models need a ZDR-eligible endpoint supporting JSON-schema structured
-outputs. Requests fail closed if no compatible endpoint exists. The bot never
+outputs; check `https://openrouter.ai/api/v1/endpoints/zdr` for current options. Requests fail closed if no compatible endpoint exists. The bot never
 falls back to non-ZDR routing. Web-search `:online` models are rejected; do not
 configure OpenRouter presets or account integrations that enable external tools
 or prompt logging.
 
 ## Moderator commands
 
-Both commands require **Manage Threads**, checked at runtime as well as in default
-command permissions. The caller must also have access and Manage Threads in the
-target channel in the same server. Replies are ephemeral.
+Only users listed in `COMMAND_USER_IDS` can run the commands; everyone else gets an
+ephemeral refusal. Allowed users also need **Manage Threads**, plus access and
+Manage Threads in the target channel in the same server. Replies are ephemeral.
 
-- **`/autotag thread [thread_id]`** — replace all tags on the current thread, or supply a thread ID.
-- **`/autotag active forum:<forum> [limit:20]`** — retag up to 100 active threads,
-  newest first, sequentially. Reports updated, unchanged, and failed counts.
+Discord decides who *sees* the commands. They default to administrators only. To
+hide them from other administrators too, open **Server Settings → Integrations →**
+your bot, deny `/autotag` for `@everyone`, and allow your own account. The user ID
+allowlist is enforced even if someone can see the commands.
+
+- **`/autotag thread [thread_id]`** — tag the current thread, or supply a thread ID.
+  Tagging runs one thread at a time; if other work is queued, the command can time
+  out after a minute and asks you to retry.
+- **`/autotag active forum:<forum> [limit:20]`** — tag up to 100 active threads,
+  newest first, sequentially. Reports updated, unchanged, skipped (ineligible, such
+  as locked or missing a starter message), and failed counts.
   Only one batch per forum can run at a time. A batch stops after ten minutes,
   reporting partial progress; individual thread IDs can handle remaining posts.
   Re-running a limited batch examines the newest threads again, not a saved cursor.
@@ -92,14 +105,23 @@ the title and up to 6,000 characters of the **starter message**, not replies,
 attachment contents, embeds, or linked pages. An image-only post is classified
 from its title. Missing starter messages are skipped after brief retries.
 
-All existing forum tags, including moderator-only tags, are eligible for selection.
-Every run replaces **all applied tags**, including ones added manually. Full
-five-tag posts are reclassified too. A valid empty AI selection clears all applied
-tags; an invalid response or failed classification leaves them unchanged.
-Single-thread results report additions and removals; removal-only changes count as
-updated in batch results. Archived/locked threads and forums without any available
-tags are skipped. If a selected tag is deleted during classification, the bot skips
-the write so a stale selection cannot accidentally clear the thread.
+Only member-selectable tags are offered to the model. Moderator-only tags are
+never applied by the bot, so post text cannot talk the model into setting one, and
+they are kept on the thread in both modes. If the model returns more than
+`MAX_AI_TAGS` tags, duplicates are dropped and the most relevant ones are kept.
+A thread never exceeds Discord's five-tag limit.
+
+- **`add` (default):** AI tags are appended after existing tags, up to five in total.
+  Nothing is removed, so a full five-tag post is left unchanged.
+- **`replace`:** every run replaces member-selectable tags, including ones added
+  manually, with the AI selection. A valid empty AI selection clears them, unless
+  the forum requires a tag, in which case the write is skipped.
+
+An invalid response or failed classification leaves tags unchanged. Single-thread
+results report additions and removals; removal-only changes count as updated in
+batch results. Archived/locked threads and forums without member-selectable tags
+are skipped. If a selected tag is deleted or made moderator-only during
+classification, the bot skips the write so a stale selection is never applied.
 
 ## Privacy and retagging boundaries
 
@@ -114,7 +136,8 @@ the selected inference provider. No author IDs, message IDs, attachment download
 or chat history are intentionally included (the text itself can contain personal
 information). Data exists transiently in process memory. There is no application
 database, on-disk message persistence, or prompt/response logging. Logs contain
-operational status, thread IDs, and exception types only.
+operational status, thread IDs, and exception types. Unexpected errors also log a
+stack trace, without event arguments or message content.
 
 [ZDR is a provider-routing policy](https://openrouter.ai/docs/guides/features/zdr),
 not a claim that data never leaves Discord. OpenRouter can retain usage metadata;
@@ -124,9 +147,8 @@ providers, and permission failures do not cause destructive tag edits or weaker
 privacy retries. API calls can incur charges; there are no automatic inference retries.
 
 The bot serializes its own work and fetches fresh tags before replacing them.
-**Manual edits made during classification can be overwritten intentionally** by
-the complete AI selection. Discord offers no conditional write, so edits by other
-clients can race with the final write too. Use one instance and avoid concurrent
+Discord offers no conditional write, so **tag edits made by others during
+classification can be overwritten** by the final write. Use one instance and avoid concurrent
 tag automation. Raw tag IDs are used to count removals even when discord.py's parent
 cache is stale; the dependency is bounded to the tested 2.7 series because this
 uses its internal raw-ID representation together with its public `edit` method.
@@ -142,7 +164,7 @@ uv run ruff format --check .
 
 Tests use mocked HTTP and Discord state; they do not send Discord messages, call
 paid models, or require credentials. For a live smoke test, use a private test
-server: create a post with an irrelevant manual tag, confirm it is replaced by
-relevant existing tags, try a full five-tag post and a valid empty selection, and
-verify a member without Manage Threads cannot run
-either command. Check OpenRouter activity/settings for the selected ZDR provider.
+server: create a post with a manual tag and confirm relevant tags are added
+alongside it; with `TAG_MODE=replace`, confirm an irrelevant tag is replaced but a
+moderator-only tag stays, and try a valid empty selection in a forum that requires
+tags. Verify that a user missing from `COMMAND_USER_IDS` cannot run either command. Check OpenRouter activity/settings for the selected ZDR provider.

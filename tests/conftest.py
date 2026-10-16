@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import json
 from copy import deepcopy
 from types import SimpleNamespace
@@ -15,7 +16,9 @@ from artcraft.config import Config
 @pytest.fixture
 async def world(monkeypatch):
     """Real discord.py models/merging over in-memory Discord and OpenRouter transports."""
-    bot = ArtCraftBot(Config("fake-token", "fake-key", frozenset({100})))
+    bot = ArtCraftBot(
+        Config("fake-token", "fake-key", frozenset({100}), command_user_ids=frozenset({2}))
+    )
     bot._connection.user = discord.ClientUser(
         state=bot._connection,
         data={"id": "1", "username": "ArtCraft", "discriminator": "0", "avatar": None},
@@ -156,6 +159,11 @@ async def world(monkeypatch):
     bot.tagger.classifier.http = bot.http_client
     yield world
     await bot.close()
+
+
+@pytest.fixture
+def replace_mode(world):
+    world.bot.tagger.config = dataclasses.replace(world.bot.config, tag_mode="replace")
 
 
 @pytest.fixture

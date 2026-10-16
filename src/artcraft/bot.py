@@ -53,18 +53,24 @@ class ArtCraftBot(discord.Client):
             log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
 
     async def on_error(self, event_method: str, *args, **kwargs) -> None:
-        # Do not log exception bodies or event arguments containing Discord content.
-        log.error("Discord event %s failed", event_method)
+        # Log the traceback for debugging, but never the event arguments, which
+        # contain Discord content.
+        log.exception("Discord event %s failed", event_method)
 
     async def command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
-        log.warning("Command failed (%s)", type(error).__name__)
+        if isinstance(error, app_commands.CommandInvokeError):
+            log.error("Command failed (%s)", type(error.original).__name__, exc_info=error.original)
+        else:
+            log.warning("Command failed (%s)", type(error).__name__)
         message = (
             "Command failed. Check bot permissions and configuration, then inspect the thread."
         )
-        if isinstance(error, app_commands.CheckFailure):
+        if isinstance(error, app_commands.MissingPermissions):
             message = "This command requires Manage Threads in a server channel."
+        elif isinstance(error, app_commands.CheckFailure):
+            message = "You are not allowed to use this command."
         if interaction.response.is_done():
             await interaction.followup.send(message, ephemeral=True)
         else:
@@ -72,7 +78,9 @@ class ArtCraftBot(discord.Client):
 
 
 @app_commands.guild_only()
-@app_commands.default_permissions(manage_threads=True)
+# Hidden from everyone except administrators until a server admin grants access in
+# Server Settings > Integrations. The user allowlist below is enforced regardless.
+@app_commands.default_permissions()
 class TagCommands(
     app_commands.Group, name="autotag", description="AI forum tagging for moderators"
 ):
@@ -80,6 +88,10 @@ class TagCommands(
         super().__init__()
         self.bot = bot
         self.running_batches: set[int] = set()
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Runs before every subcommand; a False result raises CheckFailure.
+        return interaction.user.id in self.bot.config.command_user_ids
 
     def can_manage(self, interaction: discord.Interaction, channel) -> bool:
         if interaction.guild_id != channel.guild.id or not isinstance(
@@ -89,9 +101,7 @@ class TagCommands(
         permissions = channel.permissions_for(interaction.user)
         return permissions.view_channel and permissions.manage_threads
 
-    @app_commands.command(
-        name="thread", description="Replace all tags on this thread or a thread ID"
-    )
+    @app_commands.command(name="thread", description="AI-tag this thread or a thread ID")
     @app_commands.describe(thread_id="Optional thread ID; defaults to the thread you are in")
     @app_commands.checks.has_permissions(manage_threads=True)
     async def tag_thread(self, interaction: discord.Interaction, thread_id: str | None = None):
@@ -111,13 +121,19 @@ class TagCommands(
                 ephemeral=True,
             )
             return
-        async with asyncio.timeout(60):
-            result = await self.bot.tagger.tag(target.id)
+        try:
+            # Includes waiting for other tagging work, which runs one thread at a time.
+            async with asyncio.timeout(60):
+                result = await self.bot.tagger.tag(target.id)
+        except TimeoutError:
+            await interaction.followup.send(
+                "Timed out; other tagging work may be queued. Try again shortly.",
+                ephemeral=True,
+            )
+            return
         await interaction.followup.send(result.reason, ephemeral=True)
 
-    @app_commands.command(
-        name="active", description="Replace all tags on active threads in an enabled forum"
-    )
+    @app_commands.command(name="active", description="AI-tag active threads in an enabled forum")
     @app_commands.describe(forum="Enabled forum", limit="Maximum threads to examine (default 20)")
     @app_commands.checks.has_permissions(manage_threads=True)
     async def tag_active(
@@ -142,7 +158,8 @@ class TagCommands(
             )
             return
         self.running_batches.add(forum.id)
-        changed = skipped = failed = completed = 0
+        counts = {"updated": 0, "unchanged": 0, "skipped": 0}
+        failed = completed = 0
         selected = []
         available = 0
         timed_out = False
@@ -160,10 +177,7 @@ class TagCommands(
                 for thread in selected:
                     try:
                         result = await self.bot.tagger.tag(thread.id)
-                        if result.added or result.removed:
-                            changed += 1
-                        else:
-                            skipped += 1
+                        counts[result.status] += 1
                     except (ClassificationError, discord.HTTPException) as exc:
                         failed += 1
                         log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
@@ -175,7 +189,8 @@ class TagCommands(
         await interaction.followup.send(
             f"Batch {'stopped at the 10-minute deadline' if timed_out else 'finished'}. "
             f"Examined {completed}/{len(selected)} selected threads ({available} active in forum): "
-            f"{changed} updated, {skipped} unchanged, {failed} failed. "
+            f"{counts['updated']} updated, {counts['unchanged']} unchanged, "
+            f"{counts['skipped']} skipped, {failed} failed. "
             "Newest threads are examined first; archived threads are excluded.",
             ephemeral=True,
         )

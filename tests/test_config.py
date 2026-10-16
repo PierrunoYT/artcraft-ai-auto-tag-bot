@@ -10,13 +10,17 @@ def config_env(monkeypatch):
     monkeypatch.setenv("FORUM_CHANNEL_IDS", "100, 200,100")
     monkeypatch.delenv("OPENROUTER_MODEL", raising=False)
     monkeypatch.delenv("MAX_AI_TAGS", raising=False)
+    monkeypatch.delenv("TAG_MODE", raising=False)
+    monkeypatch.delenv("COMMAND_USER_IDS", raising=False)
 
 
 def test_defaults_and_secrets_are_not_in_repr():
     config = Config.from_env()
-    assert config.model == "openai/gpt-4.1-mini"
+    assert config.model == "openai/gpt-6-luna"
     assert config.forum_channel_ids == frozenset({100, 200})
     assert config.max_ai_tags == 3
+    assert config.tag_mode == "add"
+    assert config.command_user_ids == frozenset()
     assert "private" not in repr(config)
 
 
@@ -32,7 +36,10 @@ def test_defaults_and_secrets_are_not_in_repr():
         ("DISCORD_TOKEN", ""),
         ("OPENROUTER_API_KEY", ""),
         ("OPENROUTER_MODEL", ""),
-        ("OPENROUTER_MODEL", "openai/gpt-4.1-mini:online"),
+        ("OPENROUTER_MODEL", "openai/gpt-6-luna:online"),
+        ("TAG_MODE", "merge"),
+        ("COMMAND_USER_IDS", "123,abc"),
+        ("COMMAND_USER_IDS", "0"),
     ],
 )
 def test_invalid_config_fails_before_connecting(monkeypatch, name, value):
@@ -44,3 +51,13 @@ def test_invalid_config_fails_before_connecting(monkeypatch, name, value):
 def test_model_is_configurable(monkeypatch):
     monkeypatch.setenv("OPENROUTER_MODEL", "another/model")
     assert Config.from_env().model == "another/model"
+
+
+def test_tag_mode_is_configurable(monkeypatch):
+    monkeypatch.setenv("TAG_MODE", " Replace ")
+    assert Config.from_env().tag_mode == "replace"
+
+
+def test_command_users_are_configurable(monkeypatch):
+    monkeypatch.setenv("COMMAND_USER_IDS", "293486003245809664, 42")
+    assert Config.from_env().command_user_ids == frozenset({293486003245809664, 42})

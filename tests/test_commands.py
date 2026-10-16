@@ -1,14 +1,32 @@
+import asyncio
 from copy import deepcopy
+from unittest.mock import AsyncMock
 
 import discord
 import pytest
 from discord import app_commands
 
 
-async def test_commands_are_moderator_only_at_runtime(world, interaction):
+async def test_commands_are_hidden_and_restricted_to_allowed_users(world, interaction):
     group = world.bot.tree.get_command("autotag")
     assert group.guild_only
-    assert group.default_permissions.manage_threads
+    # No default permissions: only administrators see the commands unless granted.
+    assert group.default_permissions == discord.Permissions.none()
+    assert await group.interaction_check(interaction)
+    interaction.user = world.guild.get_member(3)
+    assert not await group.interaction_check(interaction)
+
+
+async def test_disallowed_user_gets_ephemeral_refusal(world, interaction):
+    interaction.response.send_message = AsyncMock()
+    interaction.response.is_done = lambda: False
+    await world.bot.command_error(interaction, app_commands.CheckFailure())
+    assert "not allowed" in interaction.response.send_message.call_args.args[0]
+    assert interaction.response.send_message.call_args.kwargs["ephemeral"]
+
+
+async def test_commands_require_manage_threads_at_runtime(world, interaction):
+    group = world.bot.tree.get_command("autotag")
     for command in group.commands:
         assert command.checks
         interaction.permissions = discord.Permissions.none()
@@ -35,8 +53,20 @@ async def test_single_thread_checks_target_permissions(world, interaction, denia
 async def test_single_thread_defaults_to_current_thread(world, interaction):
     group = world.bot.tree.get_command("autotag")
     await group.tag_thread.callback(group, interaction)
-    assert world.channels[200]["applied_tags"] == ["11", "12"]
-    assert "added 2, removed 1" in interaction.followup.send.call_args.args[0]
+    assert world.channels[200]["applied_tags"] == ["14", "11", "12"]
+    assert "added 2, removed 0" in interaction.followup.send.call_args.args[0]
+
+
+async def test_single_thread_reports_timeout_while_other_work_holds_the_lock(
+    world, interaction, monkeypatch
+):
+    real_timeout = asyncio.timeout
+    monkeypatch.setattr(asyncio, "timeout", lambda _: real_timeout(0.01))
+    group = world.bot.tree.get_command("autotag")
+    async with world.bot.tagger.lock:
+        await group.tag_thread.callback(group, interaction)
+    assert "Timed out" in interaction.followup.send.call_args.args[0]
+    assert world.writes == []
 
 
 async def test_batch_filters_forum_limits_newest_and_continues_after_failure(world, interaction):
@@ -55,18 +85,20 @@ async def test_batch_filters_forum_limits_newest_and_continues_after_failure(wor
     world.after_inference = selective_failure
     group = world.bot.tree.get_command("autotag")
     await group.tag_active.callback(group, interaction, world.guild.get_channel(100), 3)
-    assert world.channels[201]["applied_tags"] == ["11", "12"]
+    assert world.channels[201]["applied_tags"] == ["14", "11", "12"]
     for thread_id in (200, 202, 203, 204):
         assert world.channels[thread_id]["applied_tags"] == ["14"]
     summary = interaction.followup.send.call_args.args[0]
     assert "Examined 3/3" in summary
-    assert "1 updated, 1 unchanged, 1 failed" in summary
+    assert "1 updated, 0 unchanged, 1 skipped, 1 failed" in summary
     assert interaction.followup.send.call_args.kwargs["ephemeral"]
 
 
-async def test_batch_counts_removal_only_as_updated(world, interaction):
-    world.channels[200]["applied_tags"] = ["11", "12", "14"]
+async def test_batch_counts_removal_only_as_updated(world, interaction, replace_mode):
+    world.channels[200]["applied_tags"] = ["11", "12", "13", "14"]
     group = world.bot.tree.get_command("autotag")
     await group.tag_active.callback(group, interaction, world.guild.get_channel(100))
-    assert world.channels[200]["applied_tags"] == ["11", "12"]
-    assert "1 updated, 0 unchanged, 0 failed" in interaction.followup.send.call_args.args[0]
+    assert world.channels[200]["applied_tags"] == ["14", "11", "12"]
+    assert (
+        "1 updated, 0 unchanged, 0 skipped, 0 failed" in interaction.followup.send.call_args.args[0]
+    )

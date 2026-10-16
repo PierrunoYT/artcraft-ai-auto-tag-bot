@@ -62,8 +62,9 @@ discord.py's message cache, and does not intentionally log prompts or AI respons
 bodies. Classification data is used transiently in memory rather than kept as an
 application history.
 
-Operational logs may include thread IDs, connection status, action counts, and error
-types. These logs are written to the process output. The bot does not set a log
+Operational logs may include thread IDs, connection status, action counts, error
+types, and stack traces for unexpected errors. Stack traces show code locations and
+error messages; event arguments and message contents are not logged. These logs are written to the process output. The bot does not set a log
 retention period or automatically delete logs; the hosting operator controls whether
 output is stored and for how long. Hosting diagnostics or modified configurations
 can introduce additional retention and must be disclosed by the operator.
