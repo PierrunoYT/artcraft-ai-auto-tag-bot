@@ -9,3 +9,5 @@ dist/
 *.egg-info/
 .amp/
 *.log
+# Encrypted duplicate index; personal data, never commit.
+*.db

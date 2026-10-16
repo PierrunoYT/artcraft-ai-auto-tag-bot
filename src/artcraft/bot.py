@@ -8,6 +8,7 @@ from discord import app_commands
 
 from .classifier import ClassificationError, Classifier
 from .config import Config
+from .duplicates import DuplicateFinder, DuplicateIndex, Embedder, EmbeddingError
 from .tagging import Tagger
 
 log = logging.getLogger(__name__)
@@ -22,6 +23,8 @@ class ArtCraftBot(discord.Client):
         intents = discord.Intents.none()
         intents.guilds = True
         intents.message_content = True
+        # Starter edits and deletions keep the duplicate index in sync with Discord.
+        intents.guild_messages = config.duplicates
         super().__init__(intents=intents, max_messages=None)
         self.config = config
         self.http_client = httpx.AsyncClient()
@@ -32,11 +35,29 @@ class ArtCraftBot(discord.Client):
             ),
             config,
         )
+        self.duplicates: DuplicateFinder | None = None
+        if config.duplicates:
+            self.duplicates = DuplicateFinder(
+                self,
+                Embedder(self.http_client, config.openrouter_api_key, config.embedding_model),
+                DuplicateIndex(
+                    config.duplicate_db_path, config.duplicate_db_key, config.embedding_model
+                ),
+                config,
+                self.tagger.slots,
+            )
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(TagCommands(self))
         self.tree.on_error = self.command_error
 
     async def setup_hook(self) -> None:
+        if self.duplicates:
+            removed = self.duplicates.index.keep_forums(self.config.forum_channel_ids)
+            log.info(
+                "Duplicate index: %d posts (%d removed from unconfigured forums)",
+                len(self.duplicates.index),
+                removed,
+            )
         await self.tree.sync()
 
     async def close(self) -> None:
@@ -44,6 +65,8 @@ class ArtCraftBot(discord.Client):
             await super().close()
         finally:
             await self.http_client.aclose()
+            if self.duplicates:
+                self.duplicates.index.close()
 
     async def on_ready(self) -> None:
         log.info("ArtCraft connected; %d forum(s) configured", len(self.config.forum_channel_ids))
@@ -56,6 +79,39 @@ class ArtCraftBot(discord.Client):
             await self.tagger.tag(thread.id)
         except (ClassificationError, discord.HTTPException) as exc:
             log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
+        if self.duplicates:
+            try:
+                await self.duplicates.check_new_post(thread)
+            except (EmbeddingError, discord.HTTPException) as exc:
+                log.warning("Thread %s duplicate check failed (%s)", thread.id, type(exc).__name__)
+
+    def forget_deleted(self, thread_id: int) -> None:
+        if self.duplicates and self.duplicates.index.remove(thread_id):
+            log.info("Thread %s removed from the duplicate index (deleted on Discord)", thread_id)
+
+    async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
+        self.forget_deleted(payload.thread_id)
+
+    async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
+        if payload.message_id == payload.channel_id:  # A forum post's starter message.
+            self.forget_deleted(payload.channel_id)
+
+    async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
+        if payload.channel_id in payload.message_ids:
+            self.forget_deleted(payload.channel_id)
+
+    async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
+        if not self.duplicates or payload.message_id != payload.channel_id:
+            return
+        if payload.channel_id not in self.duplicates.index:
+            return
+        try:
+            thread = await self.fetch_channel(payload.channel_id)
+            if isinstance(thread, discord.Thread):
+                await self.duplicates.index_post(thread, refresh=True)
+                log.info("Thread %s re-indexed after its starter was edited", thread.id)
+        except (EmbeddingError, discord.HTTPException) as exc:
+            log.warning("Thread %s re-index failed (%s)", payload.channel_id, type(exc).__name__)
 
     async def on_error(self, event_method: str, *args, **kwargs) -> None:
         # Log the traceback for debugging, but never the event arguments, which
@@ -118,20 +174,28 @@ class TagCommands(
         permissions = channel.permissions_for(interaction.user)
         return permissions.view_channel and permissions.manage_threads
 
-    @app_commands.command(name="thread", description="AI-tag this thread or a thread ID")
-    @app_commands.describe(thread_id="Optional thread ID; defaults to the thread you are in")
-    @app_commands.checks.has_permissions(manage_threads=True)
-    async def tag_thread(self, interaction: discord.Interaction, thread_id: str | None = None):
-        await interaction.response.defer(ephemeral=True, thinking=True)
+    async def parse_thread_id(
+        self, interaction: discord.Interaction, thread_id: str | None
+    ) -> int | None:
+        """Parse a thread ID option (default: the current channel), replying on error."""
         try:
             target_id = int(thread_id) if thread_id is not None else interaction.channel_id
         except ValueError:
             await interaction.followup.send("Supply a numeric thread ID.", ephemeral=True)
-            return
+            return None
         if target_id is None or not 0 < target_id < 2**64:
             await interaction.followup.send("Supply a valid thread ID.", ephemeral=True)
-            return
-        log.info("/autotag thread by user %s on thread %s", interaction.user.id, target_id)
+            return None
+        return target_id
+
+    async def resolve_thread(
+        self, interaction: discord.Interaction, thread_id: str | None, command: str
+    ) -> discord.Thread | None:
+        """Fetch a thread the caller can manage in this server, replying on error."""
+        target_id = await self.parse_thread_id(interaction, thread_id)
+        if target_id is None:
+            return None
+        log.info("/autotag %s by user %s on thread %s", command, interaction.user.id, target_id)
         target = await self.bot.fetch_channel(target_id)
         if not isinstance(target, discord.Thread) or not self.can_manage(interaction, target):
             log.info("Thread %s refused: not a thread the user can manage", target_id)
@@ -139,6 +203,16 @@ class TagCommands(
                 "Choose a thread in this server where you have View Channel and Manage Threads.",
                 ephemeral=True,
             )
+            return None
+        return target
+
+    @app_commands.command(name="thread", description="AI-tag this thread or a thread ID")
+    @app_commands.describe(thread_id="Optional thread ID; defaults to the thread you are in")
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def tag_thread(self, interaction: discord.Interaction, thread_id: str | None = None):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target = await self.resolve_thread(interaction, thread_id, "thread")
+        if target is None:
             return
         try:
             # Includes waiting for other tagging work, which runs one thread at a time.
@@ -299,8 +373,9 @@ class TagCommands(
         include_archived: bool,
     ) -> None:
         counts = new_counts()
+        indexed = 0
         try:
-            await self.tag_threads(
+            indexed = await self.tag_threads(
                 threads,
                 counts,
                 include_archived,
@@ -318,9 +393,11 @@ class TagCommands(
             f"Examined {completed}/{len(threads)} posts: {counts['updated']} updated, "
             f"{counts['unchanged']} unchanged, {counts['skipped']} skipped, {failed} failed."
         )
+        if self.bot.duplicates:
+            summary += f" {indexed} newly indexed for duplicate detection."
         log.info(
             "Full run on forum %s %s: %d/%d examined, %d updated, %d unchanged, "
-            "%d skipped, %d failed",
+            "%d skipped, %d failed, %d indexed",
             forum.id,
             "stopped" if stopped else "finished",
             completed,
@@ -329,6 +406,7 @@ class TagCommands(
             counts["unchanged"],
             counts["skipped"],
             failed,
+            indexed,
         )
         await self.report(interaction, summary)
 
@@ -339,11 +417,15 @@ class TagCommands(
         include_archived: bool = False,
         should_stop: Callable[[], bool] = lambda: False,
         progress: str | None = None,
-    ) -> None:
-        """Tag threads with parallel workers, roughly newest first, updating counts."""
+    ) -> int:
+        """Tag (and index, if enabled) threads with parallel workers, roughly newest
+        first, updating counts. Returns how many posts were added to the duplicate index."""
         pending = iter(threads)  # Shared: each worker takes the next unclaimed thread.
+        duplicates = self.bot.duplicates
+        indexed = 0
 
         async def worker() -> None:
+            nonlocal indexed
             for thread in pending:
                 if should_stop():
                     return
@@ -353,6 +435,13 @@ class TagCommands(
                 except (ClassificationError, discord.HTTPException) as exc:
                     counts["failed"] += 1
                     log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
+                if duplicates:
+                    # Indexes locked posts and forums without tags too; already
+                    # indexed posts are skipped, so re-runs cost nothing extra.
+                    try:
+                        indexed += await duplicates.index_post(thread)
+                    except (EmbeddingError, discord.HTTPException) as exc:
+                        log.warning("Thread %s indexing failed (%s)", thread.id, type(exc).__name__)
                 done = sum(counts.values())
                 if progress and done % 25 == 0:
                     log.info("%s: %d/%d done", progress, done, len(threads))
@@ -360,6 +449,7 @@ class TagCommands(
         async with asyncio.TaskGroup() as group:
             for _ in range(self.bot.config.tag_concurrency):
                 group.create_task(worker())
+        return indexed
 
     async def report(self, interaction: discord.Interaction, message: str) -> None:
         # Interaction follow-ups expire after 15 minutes; fall back to a DM.
@@ -386,4 +476,67 @@ class TagCommands(
         self.stop_requests.add(forum.id)
         await interaction.response.send_message(
             "Stopping after the current post; the summary follows.", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="similar", description="Show the posts most similar to this thread or a thread ID"
+    )
+    @app_commands.describe(thread_id="Optional thread ID; defaults to the thread you are in")
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def similar(self, interaction: discord.Interaction, thread_id: str | None = None):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not self.bot.duplicates:
+            await interaction.followup.send("Duplicate detection is off.", ephemeral=True)
+            return
+        target = await self.resolve_thread(interaction, thread_id, "similar")
+        if target is None:
+            return
+        try:
+            found = await self.bot.duplicates.similar_to(target)
+        except EmbeddingError as exc:
+            log.warning("Thread %s similarity lookup failed (%s)", target.id, exc)
+            await interaction.followup.send(
+                "Could not compute similarity; try again shortly.", ephemeral=True
+            )
+            return
+        if not found:
+            await interaction.followup.send(
+                "No other indexed posts in this forum yet.", ephemeral=True
+            )
+            return
+        threshold = self.bot.config.duplicate_threshold
+        lines = "\n".join(
+            f"• <#{t}> {score:.0%}{' ✅' if score >= threshold else ''}" for t, score in found
+        )
+        await interaction.followup.send(
+            f"Most similar indexed posts (✅ = at or above the {threshold:.0%} reply "
+            f"threshold):\n{lines}",
+            ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="forget", description="Delete a post's duplicate-detection data and never index it"
+    )
+    @app_commands.describe(thread_id="Thread ID whose stored data should be deleted")
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def forget(self, interaction: discord.Interaction, thread_id: str):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if not self.bot.duplicates:
+            await interaction.followup.send("Duplicate detection is off.", ephemeral=True)
+            return
+        target_id = await self.parse_thread_id(interaction, thread_id)
+        if target_id is None:
+            return
+        removed = self.bot.duplicates.index.exclude(target_id)
+        log.info(
+            "/autotag forget by user %s: thread %s excluded (data %s)",
+            interaction.user.id,
+            target_id,
+            "deleted" if removed else "was not stored",
+        )
+        await interaction.followup.send(
+            f"Deleted stored data for <#{target_id}>; it will not be indexed again."
+            if removed
+            else f"No data was stored for <#{target_id}>; it will not be indexed in future.",
+            ephemeral=True,
         )

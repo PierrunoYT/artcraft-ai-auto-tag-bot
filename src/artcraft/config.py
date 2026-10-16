@@ -4,7 +4,10 @@ import os
 from dataclasses import dataclass, field
 from typing import Literal
 
+from cryptography.fernet import Fernet
+
 DEFAULT_MODEL = "openai/gpt-6-luna"
+DEFAULT_EMBEDDING_MODEL = "openai/text-embedding-3-small"
 
 
 @dataclass(frozen=True)
@@ -20,6 +23,14 @@ class Config:
     command_user_ids: frozenset[int] = frozenset()
     # Posts classified and written at the same time, across events and batches.
     tag_concurrency: int = 4
+    # Duplicate detection stores encrypted embeddings; off unless explicitly enabled.
+    duplicates: bool = False
+    duplicate_db_key: str = field(default="", repr=False)
+    duplicate_db_path: str = "duplicates.db"
+    embedding_model: str = DEFAULT_EMBEDDING_MODEL
+    # Calibrated on text-embedding-3-small: rephrased duplicates scored ~0.77-0.78,
+    # related but different requests at most ~0.52.
+    duplicate_threshold: float = 0.7
 
     @classmethod
     def from_env(cls) -> Config:
@@ -61,4 +72,45 @@ class Config:
                 raise ValueError
         except ValueError:
             raise ValueError("TAG_CONCURRENCY must be an integer from 1 to 10") from None
-        return cls(token, key, ids, model, max_tags, tag_mode, command_user_ids, concurrency)
+
+        duplicates = os.getenv("DUPLICATES", "off").strip().lower()
+        if duplicates not in ("on", "off"):
+            raise ValueError("DUPLICATES must be 'on' or 'off'")
+        db_key = os.getenv("DUPLICATE_DB_KEY", "").strip()
+        if duplicates == "on":
+            try:
+                Fernet(db_key)
+            except ValueError:
+                raise ValueError(
+                    "DUPLICATE_DB_KEY must be a Fernet key when DUPLICATES=on; generate one with "
+                    '`uv run python -c "from cryptography.fernet import Fernet; '
+                    'print(Fernet.generate_key().decode())"`'
+                ) from None
+        db_path = os.getenv("DUPLICATE_DB_PATH", "duplicates.db").strip()
+        if not db_path:
+            raise ValueError("DUPLICATE_DB_PATH must be nonempty")
+        embedding_model = os.getenv("EMBEDDING_MODEL", DEFAULT_EMBEDDING_MODEL).strip()
+        if not embedding_model:
+            raise ValueError("EMBEDDING_MODEL must be nonempty")
+        try:
+            threshold = float(os.getenv("DUPLICATE_THRESHOLD", "0.7"))
+            if not 0.5 <= threshold <= 0.99:
+                raise ValueError
+        except ValueError:
+            raise ValueError("DUPLICATE_THRESHOLD must be a number from 0.5 to 0.99") from None
+
+        return cls(
+            discord_token=token,
+            openrouter_api_key=key,
+            forum_channel_ids=ids,
+            model=model,
+            max_ai_tags=max_tags,
+            tag_mode=tag_mode,
+            command_user_ids=command_user_ids,
+            tag_concurrency=concurrency,
+            duplicates=duplicates == "on",
+            duplicate_db_key=db_key,
+            duplicate_db_path=db_path,
+            embedding_model=embedding_model,
+            duplicate_threshold=threshold,
+        )

@@ -1,6 +1,6 @@
 # ArtCraft AI Auto-Tag Bot — Privacy Policy
 
-Last updated: October 16, 2026
+Last updated: October 17, 2026
 
 ## Scope and responsibility
 
@@ -30,14 +30,19 @@ and available tag names/IDs to OpenRouter for classification. Usernames, author 
 server IDs, and thread IDs are not deliberately included in the AI prompt, but
 message text and tag names may themselves contain personal information.
 
+If the operator enables duplicate detection, the same title and starter text are
+also sent to OpenRouter to compute an embedding (a list of numbers representing the
+post's meaning). The purpose is to point authors of new posts to similar earlier
+posts. Embeddings are compared only with posts in the same forum.
+
 The bot does not intentionally include replies, attachment contents, embeds, or
-linked-page contents in classification. Discord API responses can contain extra
+linked-page contents in classification or embeddings. Discord API responses can contain extra
 message metadata, which may be present transiently in process memory. The bot does
 not download attachments or browse links.
 
 ## External services
 
-OpenRouter routes classification requests to an inference provider. Every request
+OpenRouter routes classification and embedding requests to an inference provider. Every request
 requires `provider.zdr = true` and `data_collection = "deny"`; requests fail rather
 than retrying with weaker routing settings. No external tools or plugins are
 requested. The bot does not train AI models using Discord messages.
@@ -57,10 +62,20 @@ also involves GitHub's own privacy practices.
 
 ## Storage and retention
 
-The bot has no message database, does not write message contents to files, disables
-discord.py's message cache, and does not intentionally log prompts or AI response
-bodies. Classification data is used transiently in memory rather than kept as an
-application history.
+The bot does not write message contents to files, disables discord.py's message
+cache, and does not intentionally log prompts or AI response bodies. Classification
+data is used transiently in memory rather than kept as an application history.
+
+If duplicate detection is enabled, the bot stores, for each indexed post: the post
+(thread) ID, the forum ID, the embedding model name, and the post's embedding,
+encrypted at rest. It does not store titles, message text, usernames, or author IDs.
+The post ID links an entry to the Discord post, so this data is pseudonymous, not
+anonymous, and is treated as personal data. An entry is deleted when the post or its
+starter message is deleted on Discord, when its forum is removed from the bot's
+configuration, or on request. Editing a starter message replaces its entry. Entries
+are otherwise kept while the post exists and duplicate detection stays enabled. The
+data is used only for duplicate detection; it is not shared, sold, or used to train
+AI models.
 
 Operational logs record each action with a timestamp and may include thread and
 forum IDs, the user IDs of people who run or are refused moderator commands, tag
@@ -83,13 +98,15 @@ channel to ask about access, correction, deletion, objections, or other applicab
 privacy rights. Identify the affected server/thread privately and include only the
 information needed to locate the request. Do not send passwords or API tokens.
 
-There is no stored message database in the bot to search or erase, but the operator
-must assess any retained operational logs and hosting records and handle requests
-under applicable law. Requests concerning Discord or OpenRouter records may also
+The bot stores no message text. If duplicate detection is enabled, the operator can
+delete a post's stored entry and exclude it from future indexing on request. The
+operator must also assess any retained operational logs and hosting records and
+handle requests under applicable law. Requests concerning Discord or OpenRouter records may also
 need to be directed to those services. Depending on your location, you may have
 the right to complain to your local data-protection authority.
 
-The bot has no per-member opt-out command. Server administrators can disable a forum
+Members can ask the operator to exclude specific posts from duplicate detection.
+There is no self-service opt-out command. Server administrators can disable a forum
 in configuration and restart the bot, revoke access, or remove the bot entirely to
 stop future processing. Do not post sensitive information in enabled forums.
 

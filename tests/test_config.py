@@ -1,4 +1,5 @@
 import pytest
+from cryptography.fernet import Fernet
 
 from artcraft.config import Config
 
@@ -13,6 +14,9 @@ def config_env(monkeypatch):
     monkeypatch.delenv("TAG_MODE", raising=False)
     monkeypatch.delenv("COMMAND_USER_IDS", raising=False)
     monkeypatch.delenv("TAG_CONCURRENCY", raising=False)
+    for name in ("DUPLICATES", "DUPLICATE_DB_KEY", "DUPLICATE_DB_PATH", "EMBEDDING_MODEL"):
+        monkeypatch.delenv(name, raising=False)
+    monkeypatch.delenv("DUPLICATE_THRESHOLD", raising=False)
 
 
 def test_defaults_and_secrets_are_not_in_repr():
@@ -23,6 +27,9 @@ def test_defaults_and_secrets_are_not_in_repr():
     assert config.tag_mode == "add"
     assert config.command_user_ids == frozenset()
     assert config.tag_concurrency == 4
+    assert config.duplicates is False
+    assert config.duplicate_threshold == 0.7
+    assert config.embedding_model == "openai/text-embedding-3-small"
     assert "private" not in repr(config)
 
 
@@ -45,6 +52,10 @@ def test_defaults_and_secrets_are_not_in_repr():
         ("TAG_CONCURRENCY", "0"),
         ("TAG_CONCURRENCY", "11"),
         ("TAG_CONCURRENCY", "fast"),
+        ("DUPLICATES", "maybe"),
+        ("DUPLICATE_THRESHOLD", "0.2"),
+        ("DUPLICATE_THRESHOLD", "1"),
+        ("DUPLICATE_DB_PATH", " "),
     ],
 )
 def test_invalid_config_fails_before_connecting(monkeypatch, name, value):
@@ -66,6 +77,24 @@ def test_tag_mode_is_configurable(monkeypatch):
 def test_command_users_are_configurable(monkeypatch):
     monkeypatch.setenv("COMMAND_USER_IDS", "293486003245809664, 42")
     assert Config.from_env().command_user_ids == frozenset({293486003245809664, 42})
+
+
+@pytest.mark.parametrize("key", ["", "not-a-fernet-key"])
+def test_duplicates_require_a_valid_encryption_key(monkeypatch, key):
+    monkeypatch.setenv("DUPLICATES", "on")
+    monkeypatch.setenv("DUPLICATE_DB_KEY", key)
+    with pytest.raises(ValueError, match="DUPLICATE_DB_KEY"):
+        Config.from_env()
+
+
+def test_duplicates_can_be_enabled_and_key_is_not_in_repr(monkeypatch):
+    key = Fernet.generate_key().decode()
+    monkeypatch.setenv("DUPLICATES", "on")
+    monkeypatch.setenv("DUPLICATE_DB_KEY", key)
+    monkeypatch.setenv("DUPLICATE_THRESHOLD", "0.75")
+    config = Config.from_env()
+    assert (config.duplicates, config.duplicate_threshold) == (True, 0.75)
+    assert key not in repr(config)
 
 
 def test_tag_concurrency_is_configurable(monkeypatch):

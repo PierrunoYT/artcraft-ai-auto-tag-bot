@@ -10,7 +10,9 @@ using OpenRouter. Default model: **`openai/gpt-6-luna`**.
   `TAG_MODE=replace` to replace member-selectable tags with the AI selection instead.
 - Never applies or removes moderator-only tags.
 - Enforces OpenRouter zero-data-retention routing on every request.
-- No database, message files, or message-content logs; Discord message caching is disabled.
+- No message text is stored or logged; Discord message caching is disabled.
+- Optional duplicate detection (off by default): replies in new posts with links to
+  similar earlier posts, using an encrypted index of post embeddings (no text).
 - Slash commands for one thread or a batch of active threads, limited to an allowlist
   of Discord user IDs.
 
@@ -27,7 +29,8 @@ using OpenRouter. Default model: **`openai/gpt-6-luna`**.
    Enable **Message Content Intent** in its Bot settings (approval may be required
    for verified bots). No Members or Presence intent is needed.
 3. Invite it with the **`bot`** and **`applications.commands`** scopes. Grant **View
-   Channel**, **Read Message History**, and **Manage Threads** in each selected forum.
+   Channel**, **Read Message History**, and **Manage Threads** in each selected forum,
+   plus **Send Messages in Threads** if duplicate detection is enabled.
    Administrator is not needed. Make sure channel overwrites allow those permissions.
 4. Create the forum's tags in Discord. Enable Developer Mode in Discord, copy the
    forum channel IDs, and set `FORUM_CHANNEL_IDS` in `.env`.
@@ -72,6 +75,11 @@ and use URLs for your own deployment. See also the official
 | `TAG_MODE` | No | `add` (keep existing tags) or `replace` (replace member-selectable tags) |
 | `COMMAND_USER_IDS` | No | Comma-separated user IDs allowed to run `/autotag`; empty disables the commands |
 | `TAG_CONCURRENCY` | No | `4`, from 1 to 10; posts tagged at the same time across new posts and batches |
+| `DUPLICATES` | No | `off` (default) or `on`; enables duplicate detection |
+| `DUPLICATE_DB_KEY` | If `DUPLICATES=on` | Fernet key encrypting stored embeddings; keep it secret and backed up |
+| `DUPLICATE_DB_PATH` | No | `duplicates.db`; SQLite file for the encrypted index |
+| `DUPLICATE_THRESHOLD` | No | `0.7`, from 0.5 to 0.99; minimum similarity for a reply |
+| `EMBEDDING_MODEL` | No | `openai/text-embedding-3-small`; must have a ZDR endpoint |
 
 The default model is served through a ZDR endpoint with structured outputs.
 Replacement models need a ZDR-eligible endpoint supporting JSON-schema structured
@@ -109,6 +117,11 @@ someone can see the commands.
   unarchived and retagged in one edit, then archived again immediately.
 - **`/autotag stop forum:<forum>`** — stop a running `/autotag all` after the
   current post.
+- **`/autotag similar [thread_id]`** — show the five most similar indexed posts with
+  scores, marking those at or above the reply threshold. Useful for tuning
+  `DUPLICATE_THRESHOLD`.
+- **`/autotag forget thread_id:<id>`** — delete a post's stored duplicate data and
+  never index it again, for example on a member's deletion request.
 
 Only one batch or full run per forum can run at a time. Each examined post costs one
 AI call. One post takes about 8 seconds, so with the default of 4 in parallel,
@@ -142,6 +155,46 @@ batch results. Locked threads, archived threads outside `/autotag all`, and foru
 without member-selectable tags are skipped. If a selected tag is deleted or made moderator-only during
 classification, the bot skips the write so a stale selection is never applied.
 
+## Duplicate detection
+
+Off by default. To enable it, generate a key and add three lines to `.env`:
+
+```sh
+uv run python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+```
+
+```sh
+DUPLICATES=on
+DUPLICATE_DB_KEY=<the generated key>
+```
+
+Back up the key: without it the index cannot be read, and a new key means rebuilding
+the index. Update your Privacy Policy and tell members before enabling it.
+
+- **New posts:** the title and up to 6,000 characters of the starter message are
+  turned into an embedding (via OpenRouter, with the same ZDR routing) and compared
+  with other posts in the same forum. If any score at least `DUPLICATE_THRESHOLD`,
+  the bot replies in the post with links to up to three of them, then adds the post
+  to the index. Mentions are disabled in the reply.
+- **Existing posts:** `/autotag all` indexes every post it examines, including locked
+  posts and posts in forums without tags. Already indexed posts are skipped, so
+  re-running costs nothing extra. Full runs never reply in posts.
+- **Stored data:** per post, only the post ID, forum ID, embedding model name, and
+  the embedding vector, encrypted with `DUPLICATE_DB_KEY`. No titles, text,
+  usernames, or author IDs. Embeddings are derived from post text, so treat the file
+  as personal data.
+- **Kept in sync:** deleting a post or its starter message on Discord deletes its
+  entry; editing the starter re-indexes it. On startup, entries for forums no longer
+  in `FORUM_CHANNEL_IDS` and vectors from a different `EMBEDDING_MODEL` are deleted.
+  `/autotag forget` handles deletion requests. Title edits are picked up only when a
+  post is re-indexed. Deletions that happen while the bot is offline are not seen.
+- **Threshold:** calibrated on rephrased requests, where duplicates scored about
+  0.77 and related but different requests at most about 0.52. Use `/autotag similar`
+  on real posts and adjust if replies are too frequent or too rare.
+
+Enabling it also turns on the non-privileged Guild Messages intent so the bot sees
+starter edits and deletions; message content is never cached or logged.
+
 ## Privacy and retagging boundaries
 
 Each OpenRouter request includes:
@@ -153,8 +206,9 @@ Each OpenRouter request includes:
 The bot sends the title, starter text, and eligible tag names/IDs to OpenRouter and
 the selected inference provider. No author IDs, message IDs, attachment downloads,
 or chat history are intentionally included (the text itself can contain personal
-information). Data exists transiently in process memory. There is no application
-database, on-disk message persistence, or prompt/response logging.
+information). Data exists transiently in process memory. Message text is never
+written to disk or logged, and prompts and responses are not logged. The only
+application storage is the optional, encrypted duplicate index described above.
 
 Every action is logged with a timestamp: new posts, each tagging result with the
 tag names added or removed (or why a thread was skipped), command runs and refusals

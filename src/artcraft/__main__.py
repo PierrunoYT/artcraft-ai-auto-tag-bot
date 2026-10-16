@@ -16,9 +16,9 @@ def main() -> None:
     logging.getLogger("httpx").setLevel(logging.WARNING)
     try:
         config = Config.from_env()
+        bot = ArtCraftBot(config)  # Opens the duplicate index, which checks its key.
     except ValueError as exc:
         raise SystemExit(f"Configuration error: {exc}") from None
-    bot = ArtCraftBot(config)
     bot.run(config.discord_token, log_handler=None)
 
 

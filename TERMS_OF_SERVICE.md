@@ -1,6 +1,6 @@
 # ArtCraft AI Auto-Tag Bot — Terms of Service
 
-Last updated: October 16, 2026
+Last updated: October 17, 2026
 
 ## About the bot
 
@@ -11,8 +11,9 @@ use of the bot, not a grant of a software license or a promise of hosted service
 
 The bot classifies new forum posts and provides moderator commands to reclassify
 individual posts, batches of active posts, or every post in a forum, including
-archived posts. Duplicate detection, cross-linking,
-and pinned duplicate notices are not currently implemented.
+archived posts. If the operator enables duplicate detection, the bot also replies in
+new posts with links to similar earlier posts in the same forum. These suggestions
+are automated and may be wrong; a suggested post is not necessarily a duplicate.
 
 ## Server administration and acceptable use
 

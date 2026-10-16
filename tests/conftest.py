@@ -8,9 +8,11 @@ from unittest.mock import AsyncMock
 import discord
 import httpx
 import pytest
+from cryptography.fernet import Fernet
 
 from artcraft.bot import ArtCraftBot
 from artcraft.config import Config
+from artcraft.duplicates import DuplicateFinder, DuplicateIndex, Embedder
 
 
 @pytest.fixture
@@ -103,6 +105,11 @@ async def world(monkeypatch):
         fail_title=None,
         in_flight=0,
         max_in_flight=0,
+        embeddings=[],  # Embedding request payloads.
+        embedding_status=200,
+        vectors={},  # Post title -> embedding returned by the fake model.
+        sent=[],  # (channel_id, payload) for messages the bot sends.
+        deleted_starters=set(),
     )
 
     async def get_channel(channel_id):
@@ -122,6 +129,8 @@ async def world(monkeypatch):
 
     async def get_message(channel_id, message_id):
         assert channel_id == message_id  # Only the starter, never replies.
+        if channel_id in world.deleted_starters:
+            raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "")
         return {
             "id": str(message_id),
             "channel_id": str(channel_id),
@@ -147,6 +156,26 @@ async def world(monkeypatch):
         forum_threads = [t for t in threads(True) if t["parent_id"] == str(channel_id)]
         return {"threads": forum_threads, "members": [], "has_more": False}
 
+    async def send_message(channel_id, *, params):
+        world.sent.append((channel_id, params.payload))
+        return {
+            "id": "900",
+            "channel_id": str(channel_id),
+            "type": 0,
+            "content": params.payload["content"],
+            "author": {"id": "1", "username": "ArtCraft", "discriminator": "0", "avatar": None},
+            "attachments": [],
+            "embeds": [],
+            "mentions": [],
+            "mention_roles": [],
+            "pinned": False,
+            "mention_everyone": False,
+            "tts": False,
+            "timestamp": "2026-10-17T00:00:00+00:00",
+            "edited_timestamp": None,
+        }
+
+    monkeypatch.setattr(bot.http, "send_message", send_message)
     monkeypatch.setattr(bot.http, "get_public_archived_threads", archived_threads)
     monkeypatch.setattr(bot.http, "get_channel", get_channel)
     monkeypatch.setattr(bot.http, "edit_channel", edit_channel)
@@ -155,6 +184,13 @@ async def world(monkeypatch):
 
     async def inference(request):
         payload = json.loads(request.content)
+        if request.url.path.endswith("/embeddings"):
+            world.embeddings.append(payload)
+            title = payload["input"].split("\n\n")[0]
+            vector = world.vectors.get(title, [0.0, 1.0, 0.0])
+            return httpx.Response(
+                world.embedding_status, json={"data": [{"embedding": vector, "index": 0}]}
+            )
         world.requests.append(payload)
         world.in_flight += 1
         world.max_in_flight = max(world.max_in_flight, world.in_flight)
@@ -183,6 +219,29 @@ async def world(monkeypatch):
     bot.tagger.classifier.http = bot.http_client
     yield world
     await bot.close()
+
+
+DB_KEY = Fernet.generate_key().decode()
+
+
+@pytest.fixture
+def duplicates(world, tmp_path):
+    """Enable duplicate detection with an encrypted index in a temporary directory."""
+    config = dataclasses.replace(
+        world.bot.config,
+        duplicates=True,
+        duplicate_db_key=DB_KEY,
+        duplicate_db_path=str(tmp_path / "duplicates.db"),
+    )
+    world.bot.config = config
+    world.bot.duplicates = DuplicateFinder(
+        world.bot,
+        Embedder(world.bot.http_client, "fake-key", config.embedding_model),
+        DuplicateIndex(config.duplicate_db_path, DB_KEY, config.embedding_model),
+        config,
+        world.bot.tagger.slots,
+    )
+    return world.bot.duplicates
 
 
 @pytest.fixture
