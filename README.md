@@ -100,8 +100,22 @@ someone can see the commands.
   Only one batch per forum can run at a time. A batch stops after ten minutes,
   reporting partial progress; individual thread IDs can handle remaining posts.
   Re-running a limited batch examines the newest threads again, not a saved cursor.
+- **`/autotag all forum:<forum> [include_archived:True]`** — tag **every** post in
+  the forum, active and archived, newest first, one at a time. It runs in the
+  background with no post or time limit; new posts are still tagged meanwhile, and
+  progress is logged every 25 posts. The summary arrives as a command reply, or by
+  DM if the run outlasts Discord's 15-minute reply window. Archived posts are
+  unarchived and retagged in one edit, then archived again immediately.
+- **`/autotag stop forum:<forum>`** — stop a running `/autotag all` after the
+  current post.
 
-Archived and locked threads are never reopened or changed. Classification uses
+Only one batch or full run per forum can run at a time. Each examined post costs one
+AI call, so a forum with thousands of posts takes a while; at roughly 2–5 seconds
+per post, 1,000 posts take about an hour.
+
+Locked threads are never changed. Archived threads are changed only by
+`/autotag all`; new posts, `/autotag thread`, and `/autotag active` skip them.
+Classification uses
 the title and up to 6,000 characters of the **starter message**, not replies,
 attachment contents, embeds, or linked pages. An image-only post is classified
 from its title. Missing starter messages are skipped after brief retries.
@@ -120,8 +134,8 @@ A thread never exceeds Discord's five-tag limit.
 
 An invalid response or failed classification leaves tags unchanged. Single-thread
 results report additions and removals; removal-only changes count as updated in
-batch results. Archived/locked threads and forums without member-selectable tags
-are skipped. If a selected tag is deleted or made moderator-only during
+batch results. Locked threads, archived threads outside `/autotag all`, and forums
+without member-selectable tags are skipped. If a selected tag is deleted or made moderator-only during
 classification, the bot skips the write so a stale selection is never applied.
 
 ## Privacy and retagging boundaries

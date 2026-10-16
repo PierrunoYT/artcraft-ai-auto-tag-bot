@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from copy import deepcopy
+from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
 import discord
@@ -116,3 +117,66 @@ async def test_command_use_and_refusals_are_logged_with_user_ids(world, interact
     assert "/autotag active by user 2 on forum 100 (limit 20)" in caplog.text
     assert "Batch on forum 100 finished: 1/1 examined, 0 updated, 1 unchanged" in caplog.text
     assert "/autotag thread by user 2 refused (CheckFailure)" in caplog.text
+
+
+def add_threads(world, archived=(), other_forum=()):
+    for thread_id in (201, 202, 203, 204):
+        world.channels[thread_id] = deepcopy(world.channels[200])
+        world.channels[thread_id]["id"] = str(thread_id)
+        world.channels[thread_id]["thread_metadata"]["archived"] = thread_id in archived
+        if thread_id in other_forum:
+            world.channels[thread_id]["parent_id"] = "101"
+
+
+async def test_all_tags_every_post_including_archived_in_background(world, interaction):
+    add_threads(world, archived=(202, 203, 204), other_forum=(204,))
+    world.channels[201]["thread_metadata"]["locked"] = True
+    group = world.bot.tree.get_command("autotag")
+    await group.tag_all.callback(group, interaction, world.guild.get_channel(100))
+    assert (
+        "Started tagging 4 posts (2 active, 2 archived)"
+        in (interaction.followup.send.call_args.args[0])
+    )
+    await group.full_runs[100]
+    for thread_id in (200, 202, 203):
+        assert world.channels[thread_id]["applied_tags"] == ["14", "11", "12"]
+    for thread_id in (202, 203):
+        assert world.channels[thread_id]["thread_metadata"]["archived"] is True
+    assert world.channels[201]["applied_tags"] == ["14"]  # Locked.
+    assert world.channels[204]["applied_tags"] == ["14"]  # Other forum.
+    summary = interaction.followup.send.call_args.args[0]
+    assert "finished. Examined 4/4 posts: 3 updated, 0 unchanged, 1 skipped, 0 failed" in summary
+    assert 100 not in group.full_runs and 100 not in group.running_batches
+
+
+async def test_all_can_exclude_archived_posts(world, interaction):
+    add_threads(world, archived=(202,))
+    group = world.bot.tree.get_command("autotag")
+    await group.tag_all.callback(group, interaction, world.guild.get_channel(100), False)
+    await group.full_runs[100]
+    assert world.channels[202]["applied_tags"] == ["14"]
+    assert "Examined 4/4 posts" in interaction.followup.send.call_args.args[0]
+
+
+async def test_stop_ends_a_full_run_before_the_next_post(world, interaction):
+    add_threads(world)
+    group = world.bot.tree.get_command("autotag")
+    await group.tag_all.callback(group, interaction, world.guild.get_channel(100))
+    task = group.full_runs[100]
+    interaction.response.send_message = AsyncMock()
+    await group.stop.callback(group, interaction, world.guild.get_channel(100))
+    assert "Stopping" in interaction.response.send_message.call_args.args[0]
+    await task
+    assert world.writes == []
+    assert "stopped. Examined 0/5 posts" in interaction.followup.send.call_args.args[0]
+    await group.stop.callback(group, interaction, world.guild.get_channel(100))
+    assert "No full run" in interaction.response.send_message.call_args.args[0]
+
+
+async def test_summary_falls_back_to_dm_after_the_interaction_expires(world, interaction):
+    expired = discord.HTTPException(SimpleNamespace(status=401, reason="Unauthorized"), "")
+    interaction.followup.send = AsyncMock(side_effect=expired)
+    interaction.user = SimpleNamespace(id=2, send=AsyncMock())
+    group = world.bot.tree.get_command("autotag")
+    await group.report(interaction, "Full run finished.")
+    interaction.user.send.assert_awaited_once_with("Full run finished.")

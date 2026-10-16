@@ -106,9 +106,16 @@ async def world(monkeypatch):
         return deepcopy(world.channels[channel_id])
 
     async def edit_channel(channel_id, **fields):
+        channel = world.channels[channel_id]
+        metadata = channel["thread_metadata"]
+        # Like Discord: archived threads must be unarchived in the editing request.
+        assert not metadata["archived"] or "archived" in fields, "edit of archived thread"
         world.writes.append(channel_id)
-        world.channels[channel_id]["applied_tags"] = fields["applied_tags"]
-        return deepcopy(world.channels[channel_id])
+        if "applied_tags" in fields:
+            channel["applied_tags"] = fields["applied_tags"]
+        if "archived" in fields:
+            metadata["archived"] = fields["archived"]
+        return deepcopy(channel)
 
     async def get_message(channel_id, message_id):
         assert channel_id == message_id  # Only the starter, never replies.
@@ -123,12 +130,21 @@ async def world(monkeypatch):
             "edited_timestamp": None,
         }
 
-    async def active_threads(guild_id):
-        return {
-            "threads": [deepcopy(c) for c in world.channels.values() if c["type"] == 11],
-            "members": [],
-        }
+    def threads(archived):
+        return [
+            deepcopy(c)
+            for c in world.channels.values()
+            if c["type"] == 11 and c["thread_metadata"]["archived"] == archived
+        ]
 
+    async def active_threads(guild_id):
+        return {"threads": threads(False), "members": []}
+
+    async def archived_threads(channel_id, before=None, limit=50):
+        forum_threads = [t for t in threads(True) if t["parent_id"] == str(channel_id)]
+        return {"threads": forum_threads, "members": [], "has_more": False}
+
+    monkeypatch.setattr(bot.http, "get_public_archived_threads", archived_threads)
     monkeypatch.setattr(bot.http, "get_channel", get_channel)
     monkeypatch.setattr(bot.http, "edit_channel", edit_channel)
     monkeypatch.setattr(bot.http, "get_message", get_message)

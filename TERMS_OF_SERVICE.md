@@ -10,7 +10,8 @@ It is not affiliated with or endorsed by Discord or OpenRouter. These terms desc
 use of the bot, not a grant of a software license or a promise of hosted service.
 
 The bot classifies new forum posts and provides moderator commands to reclassify
-individual posts or batches of active posts. Duplicate detection, cross-linking,
+individual posts, batches of active posts, or every post in a forum, including
+archived posts. Duplicate detection, cross-linking,
 and pinned duplicate notices are not currently implemented.
 
 ## Server administration and acceptable use
@@ -37,8 +38,9 @@ The bot never applies or removes moderator-only tags. AI classifications may be
 inaccurate. Administrators are responsible for reviewing results and
 correcting mistakes; the bot is not a substitute for human moderation.
 
-The bot uses only tags already defined in the configured forums. Archived and
-locked threads are skipped. There is no guarantee of availability, classification
+The bot uses only tags already defined in the configured forums. Locked threads
+are skipped. Archived threads are changed only when a moderator tags a whole forum;
+they are briefly unarchived to apply tags and then archived again. There is no guarantee of availability, classification
 accuracy, recovery after downtime, or compatibility with future third-party API
 changes. Operators are responsible for their hosting and OpenRouter usage charges.
 

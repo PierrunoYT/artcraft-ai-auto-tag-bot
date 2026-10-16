@@ -194,6 +194,23 @@ async def test_actions_are_logged_with_tag_names_but_no_post_content(world, capl
     assert "digital landscape" not in caplog.text
 
 
+async def test_archived_thread_is_retagged_and_archived_again_when_included(world):
+    world.channels[200]["thread_metadata"]["archived"] = True
+    result = await world.bot.tagger.tag(200, include_archived=True)
+    assert result.status == "updated"
+    assert world.channels[200]["applied_tags"] == ["14", "11", "12"]
+    assert world.channels[200]["thread_metadata"]["archived"] is True
+    assert world.writes == [200, 200]  # Unarchive+retag, then re-archive.
+
+
+async def test_locked_archived_thread_is_skipped_even_when_archived_are_included(world):
+    world.channels[200]["thread_metadata"].update(archived=True, locked=True)
+    result = await world.bot.tagger.tag(200, include_archived=True)
+    assert result.status == "skipped"
+    assert world.requests == []
+    assert world.writes == []
+
+
 async def test_replace_mode_logs_removed_tag_names(world, replace_mode, caplog):
     world.channels[200]["applied_tags"] = ["13", "14"]
     with caplog.at_level(logging.INFO):

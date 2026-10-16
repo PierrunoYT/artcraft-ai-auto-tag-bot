@@ -97,6 +97,9 @@ class TagCommands(
         super().__init__()
         self.bot = bot
         self.running_batches: set[int] = set()
+        # Background full-forum runs by forum ID; holding the task keeps it alive.
+        self.full_runs: dict[int, asyncio.Task] = {}
+        self.stop_requests: set[int] = set()
 
     async def interaction_check(self, interaction: discord.Interaction) -> bool:
         # Runs before every subcommand; a False result raises CheckFailure.
@@ -223,4 +226,142 @@ class TagCommands(
             f"{counts['skipped']} skipped, {failed} failed. "
             "Newest threads are examined first; archived threads are excluded.",
             ephemeral=True,
+        )
+
+    @app_commands.command(
+        name="all", description="AI-tag every post in an enabled forum, including archived ones"
+    )
+    @app_commands.describe(
+        forum="Enabled forum", include_archived="Also tag archived posts (default: yes)"
+    )
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def tag_all(
+        self,
+        interaction: discord.Interaction,
+        forum: discord.ForumChannel,
+        include_archived: bool = True,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        log.info(
+            "/autotag all by user %s on forum %s (include archived: %s)",
+            interaction.user.id,
+            forum.id,
+            include_archived,
+        )
+        if forum.id not in self.bot.config.forum_channel_ids or not self.can_manage(
+            interaction, forum
+        ):
+            log.info("Forum %s refused: not enabled or user cannot manage it", forum.id)
+            await interaction.followup.send(
+                "Choose an enabled forum in this server where you have "
+                "View Channel and Manage Threads.",
+                ephemeral=True,
+            )
+            return
+        if forum.id in self.running_batches:
+            await interaction.followup.send(
+                "A batch is already running for this forum.", ephemeral=True
+            )
+            return
+        self.running_batches.add(forum.id)
+        try:
+            active = [t for t in await forum.guild.active_threads() if t.parent_id == forum.id]
+            archived = (
+                [t async for t in forum.archived_threads(limit=None)] if include_archived else []
+            )
+        except BaseException:
+            self.running_batches.discard(forum.id)
+            raise
+        threads = sorted(active + archived, key=lambda thread: thread.id, reverse=True)
+        self.stop_requests.discard(forum.id)
+        self.full_runs[forum.id] = asyncio.create_task(
+            self.run_all(interaction, forum, threads, include_archived)
+        )
+        log.info(
+            "Full run on forum %s started: %d posts (%d active, %d archived)",
+            forum.id,
+            len(threads),
+            len(active),
+            len(archived),
+        )
+        await interaction.followup.send(
+            f"Started tagging {len(threads)} posts ({len(active)} active, "
+            f"{len(archived)} archived), newest first, one at a time. New posts are still "
+            "tagged meanwhile. I'll send the summary when done (by DM if it takes over "
+            "15 minutes). Use `/autotag stop` to cancel.",
+            ephemeral=True,
+        )
+
+    async def run_all(
+        self,
+        interaction: discord.Interaction,
+        forum: discord.ForumChannel,
+        threads: list[discord.Thread],
+        include_archived: bool,
+    ) -> None:
+        counts = {"updated": 0, "unchanged": 0, "skipped": 0}
+        failed = completed = 0
+        stopped = False
+        try:
+            for thread in threads:
+                if forum.id in self.stop_requests:
+                    stopped = True
+                    break
+                try:
+                    result = await self.bot.tagger.tag(thread.id, include_archived)
+                    counts[result.status] += 1
+                except (ClassificationError, discord.HTTPException) as exc:
+                    failed += 1
+                    log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
+                completed += 1
+                if completed % 25 == 0:
+                    log.info("Full run on forum %s: %d/%d done", forum.id, completed, len(threads))
+        finally:
+            self.running_batches.discard(forum.id)
+            self.stop_requests.discard(forum.id)
+            self.full_runs.pop(forum.id, None)
+        summary = (
+            f"Full run on <#{forum.id}> {'stopped' if stopped else 'finished'}. "
+            f"Examined {completed}/{len(threads)} posts: {counts['updated']} updated, "
+            f"{counts['unchanged']} unchanged, {counts['skipped']} skipped, {failed} failed."
+        )
+        log.info(
+            "Full run on forum %s %s: %d/%d examined, %d updated, %d unchanged, "
+            "%d skipped, %d failed",
+            forum.id,
+            "stopped" if stopped else "finished",
+            completed,
+            len(threads),
+            counts["updated"],
+            counts["unchanged"],
+            counts["skipped"],
+            failed,
+        )
+        await self.report(interaction, summary)
+
+    async def report(self, interaction: discord.Interaction, message: str) -> None:
+        # Interaction follow-ups expire after 15 minutes; fall back to a DM.
+        try:
+            await interaction.followup.send(message, ephemeral=True)
+            return
+        except discord.HTTPException:
+            pass
+        try:
+            await interaction.user.send(message)
+        except discord.HTTPException:
+            log.warning("Could not deliver the summary to user %s", interaction.user.id)
+
+    @app_commands.command(name="stop", description="Stop a running /autotag all for a forum")
+    @app_commands.describe(forum="Forum whose full run should stop")
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def stop(self, interaction: discord.Interaction, forum: discord.ForumChannel):
+        log.info("/autotag stop by user %s on forum %s", interaction.user.id, forum.id)
+        if forum.id not in self.full_runs:
+            await interaction.response.send_message(
+                "No full run is active for this forum.", ephemeral=True
+            )
+            return
+        self.stop_requests.add(forum.id)
+        await interaction.response.send_message(
+            "Stopping after the current post; the summary follows.", ephemeral=True
         )

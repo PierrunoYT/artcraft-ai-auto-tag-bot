@@ -34,21 +34,23 @@ class Tagger:
         # Serialize this bot's classifications/writes and cap concurrent API spend.
         self.lock = asyncio.Lock()
 
-    async def tag(self, thread_id: int) -> TagResult:
-        result = await self._tag(thread_id)
+    async def tag(self, thread_id: int, include_archived: bool = False) -> TagResult:
+        result = await self._tag(thread_id, include_archived)
         # Reasons hold only tag names and status text, never post content.
         log.info("Thread %s %s: %s", thread_id, result.status, result.reason)
         return result
 
-    async def _tag(self, thread_id: int) -> TagResult:
+    async def _tag(self, thread_id: int, include_archived: bool) -> TagResult:
         async with self.lock:
             thread = await self.client.fetch_channel(thread_id)
             if not isinstance(thread, discord.Thread):
                 return skipped("Not a forum thread.")
             if thread.parent_id not in self.config.forum_channel_ids:
                 return skipped("Forum is not enabled.")
-            if thread.archived or thread.locked:
-                return skipped("Archived or locked threads are not changed.")
+            if thread.locked:
+                return skipped("Locked threads are not changed.")
+            if thread.archived and not include_archived:
+                return skipped("Archived threads are not changed.")
             # The gateway keeps the cached forum current; tags are re-fetched before writing.
             forum = self.client.get_channel(thread.parent_id)
             if forum is None:
@@ -87,7 +89,7 @@ class Tagger:
             # deleted tags, or change a thread that has since been locked/archived.
             forum = await self.client.fetch_channel(thread.parent_id)
             fresh = await self.client.fetch_channel(thread.id)
-            if fresh.archived or fresh.locked:
+            if fresh.locked or (fresh.archived and not include_archived):
                 return skipped("Thread was archived or locked during classification.")
             allowed = {tag.id for tag in forum.available_tags if not tag.moderated}
             if any(tag_id not in allowed for tag_id in suggestions):
@@ -114,10 +116,18 @@ class Tagger:
                 return skipped("Forum requires a tag; the empty selection was not applied.")
             # Discord has no conditional write; edits by others during classification
             # can be overwritten.
-            await fresh.edit(
-                applied_tags=[discord.Object(tag_id) for tag_id in final],
-                reason=f"ArtCraft AI tagging ({self.config.tag_mode})",
-            )
+            applied_tags = [discord.Object(tag_id) for tag_id in final]
+            reason = f"ArtCraft AI tagging ({self.config.tag_mode})"
+            if fresh.archived:
+                # Discord only edits unarchived threads: unarchive in the same request,
+                # then archive again so the post keeps its state.
+                await fresh.edit(archived=False, applied_tags=applied_tags, reason=reason)
+                try:
+                    await fresh.edit(archived=True, reason=f"{reason}; restore archive")
+                except discord.HTTPException:
+                    log.warning("Thread %s was retagged but could not be re-archived", fresh.id)
+            else:
+                await fresh.edit(applied_tags=applied_tags, reason=reason)
             names = {tag.id: tag.name for tag in forum.available_tags}
             changes = [f"+{names.get(t, t)}" for t in final if t not in existing]
             changes += [f"-{names.get(t, t)}" for t in existing if t not in final]
