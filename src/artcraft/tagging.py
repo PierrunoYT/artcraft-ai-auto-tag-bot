@@ -1,5 +1,7 @@
 import asyncio
+import contextlib
 import logging
+from collections.abc import AsyncIterator
 from dataclasses import dataclass
 from typing import Literal
 
@@ -31,8 +33,22 @@ class Tagger:
         self.client = client
         self.classifier = classifier
         self.config = config
-        # Serialize this bot's classifications/writes and cap concurrent API spend.
-        self.lock = asyncio.Lock()
+        # Caps posts in flight (and concurrent API spend) across events and batches.
+        self.slots = asyncio.Semaphore(config.tag_concurrency)
+        # Per-thread locks so duplicate events never retag the same post twice at once.
+        self._thread_locks: dict[int, tuple[asyncio.Lock, list[int]]] = {}
+
+    @contextlib.asynccontextmanager
+    async def _thread_lock(self, thread_id: int) -> AsyncIterator[None]:
+        lock, users = self._thread_locks.setdefault(thread_id, (asyncio.Lock(), [0]))
+        users[0] += 1
+        try:
+            async with lock:
+                yield
+        finally:
+            users[0] -= 1
+            if not users[0]:
+                del self._thread_locks[thread_id]
 
     async def tag(self, thread_id: int, include_archived: bool = False) -> TagResult:
         result = await self._tag(thread_id, include_archived)
@@ -41,7 +57,8 @@ class Tagger:
         return result
 
     async def _tag(self, thread_id: int, include_archived: bool) -> TagResult:
-        async with self.lock:
+        # Take the thread lock first so a waiting duplicate does not hold a slot.
+        async with self._thread_lock(thread_id), self.slots:
             thread = await self.client.fetch_channel(thread_id)
             if not isinstance(thread, discord.Thread):
                 return skipped("Not a forum thread.")

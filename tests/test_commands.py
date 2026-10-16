@@ -65,8 +65,10 @@ async def test_single_thread_reports_timeout_while_other_work_holds_the_lock(
     real_timeout = asyncio.timeout
     monkeypatch.setattr(asyncio, "timeout", lambda _: real_timeout(0.01))
     group = world.bot.tree.get_command("autotag")
-    async with world.bot.tagger.lock:
-        await group.tag_thread.callback(group, interaction)
+    slots = world.bot.tagger.slots
+    for _ in range(world.bot.config.tag_concurrency):  # Other work fills every slot.
+        await slots.acquire()
+    await group.tag_thread.callback(group, interaction)
     assert "Timed out" in interaction.followup.send.call_args.args[0]
     assert world.writes == []
 
@@ -78,13 +80,8 @@ async def test_batch_filters_forum_limits_newest_and_continues_after_failure(wor
     world.channels[204]["parent_id"] = "101"
     world.channels[202]["thread_metadata"]["locked"] = True
     world.channels[203]["name"] = "Fail this classification"
-
     # The first selected thread fails; later ones must still be processed.
-    def selective_failure():
-        title = world.requests[-1]["messages"][1]["content"]
-        world.status = 503 if "Fail this classification" in title else 200
-
-    world.after_inference = selective_failure
+    world.fail_title = "Fail this classification"
     group = world.bot.tree.get_command("autotag")
     await group.tag_active.callback(group, interaction, world.guild.get_channel(100), 3)
     assert world.channels[201]["applied_tags"] == ["14", "11", "12"]
@@ -147,6 +144,19 @@ async def test_all_tags_every_post_including_archived_in_background(world, inter
     summary = interaction.followup.send.call_args.args[0]
     assert "finished. Examined 4/4 posts: 3 updated, 0 unchanged, 1 skipped, 0 failed" in summary
     assert 100 not in group.full_runs and 100 not in group.running_batches
+
+
+async def test_full_run_tags_posts_in_parallel_up_to_the_concurrency_limit(world, interaction):
+    add_threads(world)
+    for thread_id in range(205, 215):
+        world.channels[thread_id] = deepcopy(world.channels[200])
+        world.channels[thread_id]["id"] = str(thread_id)
+    group = world.bot.tree.get_command("autotag")
+    await group.tag_all.callback(group, interaction, world.guild.get_channel(100))
+    await group.full_runs[100]
+    assert world.max_in_flight == world.bot.config.tag_concurrency == 4
+    assert len(world.requests) == 15
+    assert "Examined 15/15 posts: 15 updated" in interaction.followup.send.call_args.args[0]
 
 
 async def test_all_can_exclude_archived_posts(world, interaction):

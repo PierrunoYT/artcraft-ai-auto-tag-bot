@@ -18,6 +18,8 @@ class Config:
     tag_mode: Literal["add", "replace"] = "add"
     # Discord user IDs allowed to run /autotag; empty disables the commands.
     command_user_ids: frozenset[int] = frozenset()
+    # Posts classified and written at the same time, across events and batches.
+    tag_concurrency: int = 4
 
     @classmethod
     def from_env(cls) -> Config:
@@ -53,4 +55,10 @@ class Config:
         tag_mode = os.getenv("TAG_MODE", "add").strip().lower()
         if tag_mode not in ("add", "replace"):
             raise ValueError("TAG_MODE must be 'add' or 'replace'")
-        return cls(token, key, ids, model, max_tags, tag_mode, command_user_ids)
+        try:
+            concurrency = int(os.getenv("TAG_CONCURRENCY", "4"))
+            if not 1 <= concurrency <= 10:
+                raise ValueError
+        except ValueError:
+            raise ValueError("TAG_CONCURRENCY must be an integer from 1 to 10") from None
+        return cls(token, key, ids, model, max_tags, tag_mode, command_user_ids, concurrency)

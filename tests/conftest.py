@@ -100,6 +100,9 @@ async def world(monkeypatch):
         status=200,
         finish="stop",
         content=None,
+        fail_title=None,
+        in_flight=0,
+        max_in_flight=0,
     )
 
     async def get_channel(channel_id):
@@ -151,11 +154,16 @@ async def world(monkeypatch):
     monkeypatch.setattr(bot.http, "get_active_threads", active_threads)
 
     async def inference(request):
-        world.requests.append(json.loads(request.content))
+        payload = json.loads(request.content)
+        world.requests.append(payload)
+        world.in_flight += 1
+        world.max_in_flight = max(world.max_in_flight, world.in_flight)
         await asyncio.sleep(0)  # Permit overlapping events like a real network call.
         world.after_inference()
+        world.in_flight -= 1
+        fail = world.fail_title and world.fail_title in payload["messages"][1]["content"]
         return httpx.Response(
-            world.status,
+            503 if fail else world.status,
             json={
                 "choices": [
                     {

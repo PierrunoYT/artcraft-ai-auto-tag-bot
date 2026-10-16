@@ -71,6 +71,7 @@ and use URLs for your own deployment. See also the official
 | `MAX_AI_TAGS` | No | `3`, from 1 to 5; maximum tags the AI may choose |
 | `TAG_MODE` | No | `add` (keep existing tags) or `replace` (replace member-selectable tags) |
 | `COMMAND_USER_IDS` | No | Comma-separated user IDs allowed to run `/autotag`; empty disables the commands |
+| `TAG_CONCURRENCY` | No | `4`, from 1 to 10; posts tagged at the same time across new posts and batches |
 
 The default model is served through a ZDR endpoint with structured outputs.
 Replacement models need a ZDR-eligible endpoint supporting JSON-schema structured
@@ -95,13 +96,13 @@ someone can see the commands.
   Tagging runs one thread at a time; if other work is queued, the command can time
   out after a minute and asks you to retry.
 - **`/autotag active forum:<forum> [limit:20]`** — tag up to 100 active threads,
-  newest first, sequentially. Reports updated, unchanged, skipped (ineligible, such
+  newest first, `TAG_CONCURRENCY` at a time. Reports updated, unchanged, skipped (ineligible, such
   as locked or missing a starter message), and failed counts.
   Only one batch per forum can run at a time. A batch stops after ten minutes,
   reporting partial progress; individual thread IDs can handle remaining posts.
   Re-running a limited batch examines the newest threads again, not a saved cursor.
 - **`/autotag all forum:<forum> [include_archived:True]`** — tag **every** post in
-  the forum, active and archived, newest first, one at a time. It runs in the
+  the forum, active and archived, newest first, `TAG_CONCURRENCY` at a time. It runs in the
   background with no post or time limit; new posts are still tagged meanwhile, and
   progress is logged every 25 posts. The summary arrives as a command reply, or by
   DM if the run outlasts Discord's 15-minute reply window. Archived posts are
@@ -110,8 +111,11 @@ someone can see the commands.
   current post.
 
 Only one batch or full run per forum can run at a time. Each examined post costs one
-AI call, so a forum with thousands of posts takes a while; at roughly 2–5 seconds
-per post, 1,000 posts take about an hour.
+AI call. One post takes about 8 seconds, so with the default of 4 in parallel,
+1,000 posts take roughly 35 minutes. Raising `TAG_CONCURRENCY` speeds up full runs
+but sends more requests to Discord and OpenRouter at once; Discord rate limits are
+handled automatically by waiting. New posts share the same slots, so during a full
+run they wait at most for one post to finish.
 
 Locked threads are never changed. Archived threads are changed only by
 `/autotag all`; new posts, `/autotag thread`, and `/autotag active` skip them.
@@ -167,7 +171,8 @@ unchanged. No plugins or tools are requested. Invalid model output, unavailable
 providers, and permission failures do not cause destructive tag edits or weaker
 privacy retries. API calls can incur charges; there are no automatic inference retries.
 
-The bot serializes its own work and fetches fresh tags before replacing them.
+The bot never processes the same post twice at once, limits how many posts it
+processes in parallel, and fetches fresh tags before replacing them.
 Discord offers no conditional write, so **tag edits made by others during
 classification can be overwritten** by the final write. Use one instance and avoid concurrent
 tag automation. Raw tag IDs are used to count removals even when discord.py's parent

@@ -1,5 +1,6 @@
 import asyncio
 import logging
+from collections.abc import Callable
 
 import discord
 import httpx
@@ -10,6 +11,10 @@ from .config import Config
 from .tagging import Tagger
 
 log = logging.getLogger(__name__)
+
+
+def new_counts() -> dict[str, int]:
+    return {"updated": 0, "unchanged": 0, "skipped": 0, "failed": 0}
 
 
 class ArtCraftBot(discord.Client):
@@ -180,8 +185,7 @@ class TagCommands(
             )
             return
         self.running_batches.add(forum.id)
-        counts = {"updated": 0, "unchanged": 0, "skipped": 0}
-        failed = completed = 0
+        counts = new_counts()
         selected = []
         available = 0
         timed_out = False
@@ -196,14 +200,7 @@ class TagCommands(
                 )
                 available = len(eligible)
                 selected = eligible[:limit]
-                for thread in selected:
-                    try:
-                        result = await self.bot.tagger.tag(thread.id)
-                        counts[result.status] += 1
-                    except (ClassificationError, discord.HTTPException) as exc:
-                        failed += 1
-                        log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
-                    completed += 1
+                await self.tag_threads(selected, counts)
         except TimeoutError:
             timed_out = True
         finally:
@@ -212,18 +209,19 @@ class TagCommands(
             "Batch on forum %s %s: %d/%d examined, %d updated, %d unchanged, %d skipped, %d failed",
             forum.id,
             "timed out" if timed_out else "finished",
-            completed,
+            sum(counts.values()),
             len(selected),
             counts["updated"],
             counts["unchanged"],
             counts["skipped"],
-            failed,
+            counts["failed"],
         )
         await interaction.followup.send(
             f"Batch {'stopped at the 10-minute deadline' if timed_out else 'finished'}. "
-            f"Examined {completed}/{len(selected)} selected threads ({available} active in forum): "
-            f"{counts['updated']} updated, {counts['unchanged']} unchanged, "
-            f"{counts['skipped']} skipped, {failed} failed. "
+            f"Examined {sum(counts.values())}/{len(selected)} selected threads "
+            f"({available} active in forum): {counts['updated']} updated, "
+            f"{counts['unchanged']} unchanged, {counts['skipped']} skipped, "
+            f"{counts['failed']} failed. "
             "Newest threads are examined first; archived threads are excluded.",
             ephemeral=True,
         )
@@ -286,7 +284,8 @@ class TagCommands(
         )
         await interaction.followup.send(
             f"Started tagging {len(threads)} posts ({len(active)} active, "
-            f"{len(archived)} archived), newest first, one at a time. New posts are still "
+            f"{len(archived)} archived), newest first, "
+            f"{self.bot.config.tag_concurrency} at a time. New posts are still "
             "tagged meanwhile. I'll send the summary when done (by DM if it takes over "
             "15 minutes). Use `/autotag stop` to cancel.",
             ephemeral=True,
@@ -299,27 +298,21 @@ class TagCommands(
         threads: list[discord.Thread],
         include_archived: bool,
     ) -> None:
-        counts = {"updated": 0, "unchanged": 0, "skipped": 0}
-        failed = completed = 0
-        stopped = False
+        counts = new_counts()
         try:
-            for thread in threads:
-                if forum.id in self.stop_requests:
-                    stopped = True
-                    break
-                try:
-                    result = await self.bot.tagger.tag(thread.id, include_archived)
-                    counts[result.status] += 1
-                except (ClassificationError, discord.HTTPException) as exc:
-                    failed += 1
-                    log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
-                completed += 1
-                if completed % 25 == 0:
-                    log.info("Full run on forum %s: %d/%d done", forum.id, completed, len(threads))
+            await self.tag_threads(
+                threads,
+                counts,
+                include_archived,
+                should_stop=lambda: forum.id in self.stop_requests,
+                progress=f"Full run on forum {forum.id}",
+            )
         finally:
+            stopped = forum.id in self.stop_requests
             self.running_batches.discard(forum.id)
             self.stop_requests.discard(forum.id)
             self.full_runs.pop(forum.id, None)
+        completed, failed = sum(counts.values()), counts["failed"]
         summary = (
             f"Full run on <#{forum.id}> {'stopped' if stopped else 'finished'}. "
             f"Examined {completed}/{len(threads)} posts: {counts['updated']} updated, "
@@ -338,6 +331,35 @@ class TagCommands(
             failed,
         )
         await self.report(interaction, summary)
+
+    async def tag_threads(
+        self,
+        threads: list[discord.Thread],
+        counts: dict[str, int],
+        include_archived: bool = False,
+        should_stop: Callable[[], bool] = lambda: False,
+        progress: str | None = None,
+    ) -> None:
+        """Tag threads with parallel workers, roughly newest first, updating counts."""
+        pending = iter(threads)  # Shared: each worker takes the next unclaimed thread.
+
+        async def worker() -> None:
+            for thread in pending:
+                if should_stop():
+                    return
+                try:
+                    result = await self.bot.tagger.tag(thread.id, include_archived)
+                    counts[result.status] += 1
+                except (ClassificationError, discord.HTTPException) as exc:
+                    counts["failed"] += 1
+                    log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
+                done = sum(counts.values())
+                if progress and done % 25 == 0:
+                    log.info("%s: %d/%d done", progress, done, len(threads))
+
+        async with asyncio.TaskGroup() as group:
+            for _ in range(self.bot.config.tag_concurrency):
+                group.create_task(worker())
 
     async def report(self, interaction: discord.Interaction, message: str) -> None:
         # Interaction follow-ups expire after 15 minutes; fall back to a DM.
