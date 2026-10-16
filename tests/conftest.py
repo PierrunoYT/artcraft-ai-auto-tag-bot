@@ -172,6 +172,7 @@ def interaction(world):
         guild_id=10,
         user=world.guild.get_member(2),
         channel_id=200,
+        command=None,
         permissions=discord.Permissions(manage_threads=True),
         response=SimpleNamespace(defer=AsyncMock(), is_done=lambda: True),
         followup=SimpleNamespace(send=AsyncMock()),

@@ -85,10 +85,11 @@ Only users listed in `COMMAND_USER_IDS` can run the commands; everyone else gets
 ephemeral refusal. Allowed users also need **Manage Threads**, plus access and
 Manage Threads in the target channel in the same server. Replies are ephemeral.
 
-Discord decides who *sees* the commands. They default to administrators only. To
-hide them from other administrators too, open **Server Settings → Integrations →**
-your bot, deny `/autotag` for `@everyone`, and allow your own account. The user ID
-allowlist is enforced even if someone can see the commands.
+Discord decides who *sees* the commands. They default to members with Manage
+Threads (administrators always see them). To hide them from everyone else, a server
+admin can open **Server Settings → Integrations →** your bot, deny `/autotag` for
+`@everyone`, and allow the listed users. The user ID allowlist is enforced even if
+someone can see the commands.
 
 - **`/autotag thread [thread_id]`** — tag the current thread, or supply a thread ID.
   Tagging runs one thread at a time; if other work is queued, the command can time
@@ -135,9 +136,15 @@ The bot sends the title, starter text, and eligible tag names/IDs to OpenRouter 
 the selected inference provider. No author IDs, message IDs, attachment downloads,
 or chat history are intentionally included (the text itself can contain personal
 information). Data exists transiently in process memory. There is no application
-database, on-disk message persistence, or prompt/response logging. Logs contain
-operational status, thread IDs, and exception types. Unexpected errors also log a
-stack trace, without event arguments or message content.
+database, on-disk message persistence, or prompt/response logging.
+
+Every action is logged with a timestamp: new posts, each tagging result with the
+tag names added or removed (or why a thread was skipped), command runs and refusals
+with the caller's user ID, and batch summaries. Logs contain thread, forum, and user
+IDs, tag names, and exception types, never post titles or text. Unexpected errors
+also log a stack trace, without event arguments or message content. Logs go to the
+console; to keep them, redirect output, for example
+`uv run artcraft-bot *>> artcraft.log` in PowerShell.
 
 [ZDR is a provider-routing policy](https://openrouter.ai/docs/guides/features/zdr),
 not a claim that data never leaves Discord. OpenRouter can retain usage metadata;

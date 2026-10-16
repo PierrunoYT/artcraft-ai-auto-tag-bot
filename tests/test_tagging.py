@@ -181,3 +181,21 @@ async def test_empty_selection_is_not_applied_when_forum_requires_a_tag(world, r
     assert result.status == "skipped"
     assert world.channels[200]["applied_tags"] == ["11"]
     assert world.writes == []
+
+
+async def test_actions_are_logged_with_tag_names_but_no_post_content(world, caplog):
+    with caplog.at_level(logging.INFO):
+        await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+        await world.bot.tagger.tag(200)
+    assert "New post 200 in forum 100" in caplog.text
+    assert "Thread 200 updated: Retagged: +Painting, +Digital." in caplog.text
+    assert "Thread 200 unchanged" in caplog.text
+    assert "My digital painting" not in caplog.text
+    assert "digital landscape" not in caplog.text
+
+
+async def test_replace_mode_logs_removed_tag_names(world, replace_mode, caplog):
+    world.channels[200]["applied_tags"] = ["13", "14"]
+    with caplog.at_level(logging.INFO):
+        await world.bot.tagger.tag(200)
+    assert "Retagged: +Painting, +Digital, -Critique." in caplog.text

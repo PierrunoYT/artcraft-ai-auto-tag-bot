@@ -46,9 +46,9 @@ class ArtCraftBot(discord.Client):
     async def on_thread_create(self, thread: discord.Thread) -> None:
         if thread.parent_id not in self.config.forum_channel_ids:
             return
+        log.info("New post %s in forum %s; tagging", thread.id, thread.parent_id)
         try:
-            result = await self.tagger.tag(thread.id)
-            log.info("Thread %s: %s", thread.id, result.reason)
+            await self.tagger.tag(thread.id)
         except (ClassificationError, discord.HTTPException) as exc:
             log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
 
@@ -60,10 +60,19 @@ class ArtCraftBot(discord.Client):
     async def command_error(
         self, interaction: discord.Interaction, error: app_commands.AppCommandError
     ) -> None:
+        command = getattr(interaction.command, "qualified_name", "unknown")
         if isinstance(error, app_commands.CommandInvokeError):
-            log.error("Command failed (%s)", type(error.original).__name__, exc_info=error.original)
+            log.error(
+                "/%s by user %s failed (%s)",
+                command,
+                interaction.user.id,
+                type(error.original).__name__,
+                exc_info=error.original,
+            )
         else:
-            log.warning("Command failed (%s)", type(error).__name__)
+            log.warning(
+                "/%s by user %s refused (%s)", command, interaction.user.id, type(error).__name__
+            )
         message = (
             "Command failed. Check bot permissions and configuration, then inspect the thread."
         )
@@ -78,9 +87,9 @@ class ArtCraftBot(discord.Client):
 
 
 @app_commands.guild_only()
-# Hidden from everyone except administrators until a server admin grants access in
+# Visible to members with Manage Threads; a server admin can narrow this further in
 # Server Settings > Integrations. The user allowlist below is enforced regardless.
-@app_commands.default_permissions()
+@app_commands.default_permissions(manage_threads=True)
 class TagCommands(
     app_commands.Group, name="autotag", description="AI forum tagging for moderators"
 ):
@@ -114,8 +123,10 @@ class TagCommands(
         if target_id is None or not 0 < target_id < 2**64:
             await interaction.followup.send("Supply a valid thread ID.", ephemeral=True)
             return
+        log.info("/autotag thread by user %s on thread %s", interaction.user.id, target_id)
         target = await self.bot.fetch_channel(target_id)
         if not isinstance(target, discord.Thread) or not self.can_manage(interaction, target):
+            log.info("Thread %s refused: not a thread the user can manage", target_id)
             await interaction.followup.send(
                 "Choose a thread in this server where you have View Channel and Manage Threads.",
                 ephemeral=True,
@@ -126,6 +137,7 @@ class TagCommands(
             async with asyncio.timeout(60):
                 result = await self.bot.tagger.tag(target.id)
         except TimeoutError:
+            log.warning("Thread %s timed out waiting for other tagging work", target.id)
             await interaction.followup.send(
                 "Timed out; other tagging work may be queued. Try again shortly.",
                 ephemeral=True,
@@ -143,9 +155,16 @@ class TagCommands(
         limit: app_commands.Range[int, 1, 100] = 20,
     ):
         await interaction.response.defer(ephemeral=True, thinking=True)
+        log.info(
+            "/autotag active by user %s on forum %s (limit %s)",
+            interaction.user.id,
+            forum.id,
+            limit,
+        )
         if forum.id not in self.bot.config.forum_channel_ids or not self.can_manage(
             interaction, forum
         ):
+            log.info("Forum %s refused: not enabled or user cannot manage it", forum.id)
             await interaction.followup.send(
                 "Choose an enabled forum in this server where you have "
                 "View Channel and Manage Threads.",
@@ -186,6 +205,17 @@ class TagCommands(
             timed_out = True
         finally:
             self.running_batches.discard(forum.id)
+        log.info(
+            "Batch on forum %s %s: %d/%d examined, %d updated, %d unchanged, %d skipped, %d failed",
+            forum.id,
+            "timed out" if timed_out else "finished",
+            completed,
+            len(selected),
+            counts["updated"],
+            counts["unchanged"],
+            counts["skipped"],
+            failed,
+        )
         await interaction.followup.send(
             f"Batch {'stopped at the 10-minute deadline' if timed_out else 'finished'}. "
             f"Examined {completed}/{len(selected)} selected threads ({available} active in forum): "

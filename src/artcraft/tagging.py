@@ -1,4 +1,5 @@
 import asyncio
+import logging
 from dataclasses import dataclass
 from typing import Literal
 
@@ -6,6 +7,8 @@ import discord
 
 from .classifier import Classifier
 from .config import Config
+
+log = logging.getLogger(__name__)
 
 # Discord's limit on applied tags per forum post.
 MAX_APPLIED_TAGS = 5
@@ -32,6 +35,12 @@ class Tagger:
         self.lock = asyncio.Lock()
 
     async def tag(self, thread_id: int) -> TagResult:
+        result = await self._tag(thread_id)
+        # Reasons hold only tag names and status text, never post content.
+        log.info("Thread %s %s: %s", thread_id, result.status, result.reason)
+        return result
+
+    async def _tag(self, thread_id: int) -> TagResult:
         async with self.lock:
             thread = await self.client.fetch_channel(thread_id)
             if not isinstance(thread, discord.Thread):
@@ -109,6 +118,7 @@ class Tagger:
                 applied_tags=[discord.Object(tag_id) for tag_id in final],
                 reason=f"ArtCraft AI tagging ({self.config.tag_mode})",
             )
-            return TagResult(
-                "updated", f"Retagged: added {added}, removed {removed} tag(s).", added, removed
-            )
+            names = {tag.id: tag.name for tag in forum.available_tags}
+            changes = [f"+{names.get(t, t)}" for t in final if t not in existing]
+            changes += [f"-{names.get(t, t)}" for t in existing if t not in final]
+            return TagResult("updated", f"Retagged: {', '.join(changes)}.", added, removed)
