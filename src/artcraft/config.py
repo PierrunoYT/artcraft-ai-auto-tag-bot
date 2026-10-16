@@ -31,6 +31,8 @@ class Config:
     # Calibrated on text-embedding-3-small: rephrased duplicates scored ~0.77-0.78,
     # related but different requests at most ~0.52.
     duplicate_threshold: float = 0.7
+    # Most similar posts linked in a reply.
+    duplicate_max_matches: int = 5
 
     @classmethod
     def from_env(cls) -> Config:
@@ -98,6 +100,12 @@ class Config:
                 raise ValueError
         except ValueError:
             raise ValueError("DUPLICATE_THRESHOLD must be a number from 0.5 to 0.99") from None
+        try:
+            max_matches = int(os.getenv("DUPLICATE_MAX_MATCHES", "5"))
+            if not 1 <= max_matches <= 10:
+                raise ValueError
+        except ValueError:
+            raise ValueError("DUPLICATE_MAX_MATCHES must be an integer from 1 to 10") from None
 
         return cls(
             discord_token=token,
@@ -113,4 +121,5 @@ class Config:
             duplicate_db_path=db_path,
             embedding_model=embedding_model,
             duplicate_threshold=threshold,
+            duplicate_max_matches=max_matches,
         )

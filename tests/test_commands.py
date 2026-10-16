@@ -9,8 +9,16 @@ import pytest
 from discord import app_commands
 
 
-async def test_commands_are_hidden_and_restricted_to_allowed_users(world, interaction):
-    group = world.bot.tree.get_command("autotag")
+def test_tagging_and_duplicate_commands_are_separate_groups(world):
+    autotag = {c.name for c in world.bot.tree.get_command("autotag").commands}
+    duplicates = {c.name for c in world.bot.tree.get_command("duplicates").commands}
+    assert autotag == {"thread", "active", "all", "stop"}
+    assert duplicates == {"index", "stop", "similar", "forget"}
+
+
+@pytest.mark.parametrize("name", ["autotag", "duplicates"])
+async def test_commands_are_hidden_and_restricted_to_allowed_users(world, interaction, name):
+    group = world.bot.tree.get_command(name)
     assert group.guild_only
     # Only members with Manage Threads see the commands; the allowlist decides who runs them.
     assert group.default_permissions == discord.Permissions(manage_threads=True)
@@ -27,8 +35,9 @@ async def test_disallowed_user_gets_ephemeral_refusal(world, interaction):
     assert interaction.response.send_message.call_args.kwargs["ephemeral"]
 
 
-async def test_commands_require_manage_threads_at_runtime(world, interaction):
-    group = world.bot.tree.get_command("autotag")
+@pytest.mark.parametrize("name", ["autotag", "duplicates"])
+async def test_commands_require_manage_threads_at_runtime(world, interaction, name):
+    group = world.bot.tree.get_command(name)
     for command in group.commands:
         assert command.checks
         interaction.permissions = discord.Permissions.none()

@@ -3,6 +3,7 @@ import sqlite3
 from copy import deepcopy
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 import pytest
 from cryptography.fernet import Fernet
@@ -42,8 +43,8 @@ async def test_new_post_gets_a_reply_linking_similar_posts_and_is_indexed(world,
         "Unrelated question": [0.0, 0.0, 1.0],
         "My digital painting": SIMILAR,
     }
-    assert await index(world, duplicates, 201)
-    assert await index(world, duplicates, 202)
+    assert await index(world, duplicates, 201) == "indexed"
+    assert await index(world, duplicates, 202) == "indexed"
     await world.bot.on_thread_create(await world.bot.fetch_channel(200))
 
     [(channel_id, payload)] = world.sent
@@ -56,6 +57,39 @@ async def test_new_post_gets_a_reply_linking_similar_posts_and_is_indexed(world,
     assert request["model"] == "openai/text-embedding-3-small"
     assert request["provider"] == {"zdr": True, "data_collection": "deny"}
     assert request["input"].startswith("My digital painting\n\nA digital landscape")
+
+
+async def test_reply_lists_up_to_the_configured_number_of_matches(world, duplicates):
+    titles = [f"Gradient export bug {n}" for n in range(7)]
+    for offset, title in enumerate(titles):
+        add_thread(world, 201 + offset, title)
+        # Descending similarity, all above the threshold.
+        world.vectors[title] = [1.0, 0.05 * offset, 0.0]
+    world.vectors["My digital painting"] = [1.0, 0.0, 0.0]
+    for offset in range(7):
+        await index(world, duplicates, 201 + offset)
+    await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+    [(_, payload)] = world.sent
+    links = [line for line in payload["content"].splitlines() if line.startswith("•")]
+    assert duplicates.config.duplicate_max_matches == 5
+    assert [line.split()[1] for line in links] == [f"<#{t}>" for t in range(201, 206)]
+
+
+async def test_tagging_failure_does_not_block_the_duplicate_check(world, duplicates):
+    add_thread(world, 201, "Export loses gradients")
+    world.vectors = {"Export loses gradients": [1.0, 0.0, 0.0], "My digital painting": SIMILAR}
+    await index(world, duplicates, 201)
+    world.status = 503  # Classification fails.
+    await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+    assert world.writes == []
+    assert len(world.sent) == 1
+
+
+async def test_duplicate_failure_does_not_block_tagging(world, duplicates):
+    world.embedding_status = 503
+    await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+    assert world.channels[200]["applied_tags"] == ["14", "11", "12"]
+    assert world.sent == []
 
 
 async def test_no_reply_when_nothing_reaches_the_threshold(world, duplicates):
@@ -128,27 +162,58 @@ async def test_starter_edit_reindexes_the_post(world, duplicates):
     assert list(duplicates.index.get(200)) == [1.0, 0.0, 0.0]
 
 
-async def test_full_run_indexes_locked_posts_once(world, duplicates, interaction):
-    add_thread(world, 201, "Locked request", locked=True)
+async def test_tagging_runs_do_not_index(world, duplicates, interaction):
     group = world.bot.tree.get_command("autotag")
     await group.tag_all.callback(group, interaction, world.guild.get_channel(100))
     await group.full_runs[100]
+    assert world.embeddings == []
+    assert len(duplicates.index) == 0
+
+
+async def test_index_run_indexes_locked_posts_once_without_tagging(world, duplicates, interaction):
+    add_thread(world, 201, "Locked request", locked=True)
+    group = world.bot.tree.get_command("duplicates")
+    await group.index.callback(group, interaction, world.guild.get_channel(100))
+    assert "Started indexing 2 posts" in interaction.followup.send.call_args.args[0]
+    await group.full_runs[100]
     assert {200, 201} <= set(duplicates.index.forum_of)
-    assert "2 newly indexed" in interaction.followup.send.call_args.args[0]
+    summary = interaction.followup.send.call_args.args[0]
+    assert "Examined 2/2 posts: 2 indexed, 0 unchanged, 0 skipped, 0 failed" in summary
+    assert world.requests == [] and world.writes == []  # No classification or tag edits.
     calls = len(world.embeddings)
-    await group.tag_all.callback(group, interaction, world.guild.get_channel(100))
+    await group.index.callback(group, interaction, world.guild.get_channel(100))
     await group.full_runs[100]
     assert len(world.embeddings) == calls  # Already indexed posts are not re-embedded.
-    assert world.sent == []  # Full runs never reply in posts.
+    assert "0 indexed, 2 unchanged" in interaction.followup.send.call_args.args[0]
+    assert world.sent == []  # Index runs never reply in posts.
+
+
+async def test_index_run_can_be_stopped(world, duplicates, interaction):
+    group = world.bot.tree.get_command("duplicates")
+    await group.index.callback(group, interaction, world.guild.get_channel(100))
+    task = group.full_runs[100]
+    interaction.response.send_message = AsyncMock()
+    await group.stop.callback(group, interaction, world.guild.get_channel(100))
+    await task
+    assert world.embeddings == []
+    assert "stopped. Examined 0/1 posts" in interaction.followup.send.call_args.args[0]
+
+
+async def test_duplicate_commands_explain_when_detection_is_off(world, interaction):
+    group = world.bot.tree.get_command("duplicates")
+    await group.index.callback(group, interaction, world.guild.get_channel(100))
+    assert "Duplicate detection is off" in interaction.followup.send.call_args.args[0]
+    await group.similar.callback(group, interaction)
+    assert "Duplicate detection is off" in interaction.followup.send.call_args.args[0]
 
 
 async def test_forget_deletes_data_and_prevents_reindexing(world, duplicates, interaction):
     await index(world, duplicates, 200)
-    group = world.bot.tree.get_command("autotag")
+    group = world.bot.tree.get_command("duplicates")
     await group.forget.callback(group, interaction, "200")
     assert "Deleted stored data" in interaction.followup.send.call_args.args[0]
     calls = len(world.embeddings)
-    assert not await index(world, duplicates, 200)
+    assert await index(world, duplicates, 200) == "skipped"
     await world.bot.on_thread_create(await world.bot.fetch_channel(200))
     assert len(world.embeddings) == calls
     assert 200 not in duplicates.index
@@ -164,7 +229,7 @@ async def test_similar_command_marks_matches_above_the_threshold(world, duplicat
     }
     for thread_id in (200, 201, 202):
         await index(world, duplicates, thread_id)
-    group = world.bot.tree.get_command("autotag")
+    group = world.bot.tree.get_command("duplicates")
     await group.similar.callback(group, interaction)
     message = interaction.followup.send.call_args.args[0]
     assert "<#201> 95% ✅" in message

@@ -79,6 +79,7 @@ and use URLs for your own deployment. See also the official
 | `DUPLICATE_DB_KEY` | If `DUPLICATES=on` | Fernet key encrypting stored embeddings; keep it secret and backed up |
 | `DUPLICATE_DB_PATH` | No | `duplicates.db`; SQLite file for the encrypted index |
 | `DUPLICATE_THRESHOLD` | No | `0.7`, from 0.5 to 0.99; minimum similarity for a reply |
+| `DUPLICATE_MAX_MATCHES` | No | `5`, from 1 to 10; most similar posts linked in a reply |
 | `EMBEDDING_MODEL` | No | `openai/text-embedding-3-small`; must have a ZDR endpoint |
 
 The default model is served through a ZDR endpoint with structured outputs.
@@ -96,9 +97,15 @@ Manage Threads in the target channel in the same server. Replies are ephemeral.
 
 Discord decides who *sees* the commands. They default to members with Manage
 Threads (administrators always see them). To hide them from everyone else, a server
-admin can open **Server Settings → Integrations →** your bot, deny `/autotag` for
-`@everyone`, and allow the listed users. The user ID allowlist is enforced even if
+admin can open **Server Settings → Integrations →** your bot, deny `/autotag` and
+`/duplicates` for `@everyone`, and allow the listed users. The user ID allowlist is enforced even if
 someone can see the commands.
+
+Tagging and duplicate detection are separate: `/autotag` commands only tag, and
+`/duplicates` commands only index and compare posts. On new posts, both run
+independently, so a failure in one never blocks the other.
+
+### `/autotag` — tagging
 
 - **`/autotag thread [thread_id]`** — tag the current thread, or supply a thread ID.
   Tagging runs one thread at a time; if other work is queued, the command can time
@@ -117,14 +124,26 @@ someone can see the commands.
   unarchived and retagged in one edit, then archived again immediately.
 - **`/autotag stop forum:<forum>`** — stop a running `/autotag all` after the
   current post.
-- **`/autotag similar [thread_id]`** — show the five most similar indexed posts with
-  scores, marking those at or above the reply threshold. Useful for tuning
-  `DUPLICATE_THRESHOLD`.
-- **`/autotag forget thread_id:<id>`** — delete a post's stored duplicate data and
+
+### `/duplicates` — duplicate detection
+
+These reply "Duplicate detection is off" unless `DUPLICATES=on`.
+
+- **`/duplicates index forum:<forum> [include_archived:True]`** — index every post
+  in the forum for duplicate detection, in the background like `/autotag all`, with
+  no tagging. Includes locked posts and forums without tags. Already indexed posts
+  are skipped, so re-running only embeds new posts. Never replies in posts.
+- **`/duplicates stop forum:<forum>`** — stop a running `/duplicates index`.
+- **`/duplicates similar [thread_id] [limit:10]`** — list up to 25 of the most
+  similar indexed posts with scores, marking those at or above the reply threshold.
+  Useful for tuning `DUPLICATE_THRESHOLD`.
+- **`/duplicates forget thread_id:<id>`** — delete a post's stored duplicate data and
   never index it again, for example on a member's deletion request.
 
-Only one batch or full run per forum can run at a time. Each examined post costs one
-AI call. One post takes about 8 seconds, so with the default of 4 in parallel,
+Each group allows one batch or full run per forum at a time; a tagging run and an
+indexing run can run side by side, sharing the `TAG_CONCURRENCY` slots. Each examined post costs one
+Each examined post costs one AI call. Tagging one post takes about 8 seconds, so
+with the default of 4 in parallel,
 1,000 posts take roughly 35 minutes. Raising `TAG_CONCURRENCY` speeds up full runs
 but sends more requests to Discord and OpenRouter at once; Discord rate limits are
 handled automatically by waiting. New posts share the same slots, so during a full
@@ -174,11 +193,10 @@ the index. Update your Privacy Policy and tell members before enabling it.
 - **New posts:** the title and up to 6,000 characters of the starter message are
   turned into an embedding (via OpenRouter, with the same ZDR routing) and compared
   with other posts in the same forum. If any score at least `DUPLICATE_THRESHOLD`,
-  the bot replies in the post with links to up to three of them, then adds the post
-  to the index. Mentions are disabled in the reply.
-- **Existing posts:** `/autotag all` indexes every post it examines, including locked
-  posts and posts in forums without tags. Already indexed posts are skipped, so
-  re-running costs nothing extra. Full runs never reply in posts.
+  the bot replies in the post with links to the most similar ones (up to
+  `DUPLICATE_MAX_MATCHES`, default 5), then adds the post to the index. Mentions are
+  disabled in the reply.
+- **Existing posts:** run `/duplicates index` once per forum to build the index.
 - **Stored data:** per post, only the post ID, forum ID, embedding model name, and
   the embedding vector, encrypted with `DUPLICATE_DB_KEY`. No titles, text,
   usernames, or author IDs. Embeddings are derived from post text, so treat the file
@@ -186,10 +204,10 @@ the index. Update your Privacy Policy and tell members before enabling it.
 - **Kept in sync:** deleting a post or its starter message on Discord deletes its
   entry; editing the starter re-indexes it. On startup, entries for forums no longer
   in `FORUM_CHANNEL_IDS` and vectors from a different `EMBEDDING_MODEL` are deleted.
-  `/autotag forget` handles deletion requests. Title edits are picked up only when a
+  `/duplicates forget` handles deletion requests. Title edits are picked up only when a
   post is re-indexed. Deletions that happen while the bot is offline are not seen.
 - **Threshold:** calibrated on rephrased requests, where duplicates scored about
-  0.77 and related but different requests at most about 0.52. Use `/autotag similar`
+  0.77 and related but different requests at most about 0.52. Use `/duplicates similar`
   on real posts and adjust if replies are too frequent or too rare.
 
 Enabling it also turns on the non-privileged Guild Messages intent so the bot sees

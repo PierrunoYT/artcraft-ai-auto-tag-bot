@@ -20,7 +20,6 @@ from .config import Config
 
 log = logging.getLogger(__name__)
 
-MAX_REPLY_MATCHES = 3
 # The starter can lag THREAD_CREATE by several seconds; back off before giving up.
 NEW_POST_RETRY_DELAYS = (1, 2, 4, 8)
 
@@ -208,14 +207,19 @@ class DuplicateFinder:
         async with self.slots:
             return await self.embedder.embed(f"{thread.name[:256]}\n\n{starter.content[:6000]}")
 
-    async def index_post(self, thread: discord.Thread, refresh: bool = False) -> bool:
-        """Embed and store a post unless it is already indexed; True when stored."""
+    async def index_post(self, thread: discord.Thread, refresh: bool = False) -> str:
+        """Embed and store a post; returns "indexed", "unchanged" (already indexed),
+        or "skipped" (unconfigured forum, excluded, or no starter message)."""
         if thread.parent_id not in self.config.forum_channel_ids:
-            return False
-        if thread.id in self.index.excluded or (thread.id in self.index and not refresh):
-            return False
+            return "skipped"
+        if thread.id in self.index.excluded:
+            return "skipped"
+        if thread.id in self.index and not refresh:
+            return "unchanged"
         vector = await self._embed_post(thread)
-        return vector is not None and self.index.add(thread.id, thread.parent_id, vector)
+        if vector is None or not self.index.add(thread.id, thread.parent_id, vector):
+            return "skipped"
+        return "indexed"
 
     async def matches(
         self, forum_id: int, thread_id: int, vector: array, threshold: float, limit: int
@@ -237,7 +241,7 @@ class DuplicateFinder:
             thread.id,
             vector,
             self.config.duplicate_threshold,
-            MAX_REPLY_MATCHES,
+            self.config.duplicate_max_matches,
         )
         self.index.add(thread.id, thread.parent_id, vector)
         if not found:
@@ -251,7 +255,7 @@ class DuplicateFinder:
         await self._reply(thread, found)
         return found
 
-    async def similar_to(self, thread: discord.Thread, limit: int = 5) -> list[tuple[int, float]]:
+    async def similar_to(self, thread: discord.Thread, limit: int = 10) -> list[tuple[int, float]]:
         """Closest posts regardless of threshold, for moderators tuning detection."""
         vector = self.index.get(thread.id) or await self._embed_post(thread)
         if vector is None:

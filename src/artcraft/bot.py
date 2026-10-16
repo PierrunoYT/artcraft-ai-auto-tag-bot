@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 
 import discord
 import httpx
@@ -13,9 +13,12 @@ from .tagging import Tagger
 
 log = logging.getLogger(__name__)
 
+TAG_STATUSES = ("updated", "unchanged", "skipped", "failed")
+INDEX_STATUSES = ("indexed", "unchanged", "skipped", "failed")
 
-def new_counts() -> dict[str, int]:
-    return {"updated": 0, "unchanged": 0, "skipped": 0, "failed": 0}
+
+def new_counts(keys: tuple[str, ...] = TAG_STATUSES) -> dict[str, int]:
+    return dict.fromkeys(keys, 0)
 
 
 class ArtCraftBot(discord.Client):
@@ -48,6 +51,7 @@ class ArtCraftBot(discord.Client):
             )
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(TagCommands(self))
+        self.tree.add_command(DuplicateCommands(self))
         self.tree.on_error = self.command_error
 
     async def setup_hook(self) -> None:
@@ -74,16 +78,25 @@ class ArtCraftBot(discord.Client):
     async def on_thread_create(self, thread: discord.Thread) -> None:
         if thread.parent_id not in self.config.forum_channel_ids:
             return
-        log.info("New post %s in forum %s; tagging", thread.id, thread.parent_id)
+        log.info("New post %s in forum %s", thread.id, thread.parent_id)
+        # Tagging and duplicate checks are independent: neither waits for nor
+        # depends on the other's success.
+        jobs = [self.tag_new_post(thread)]
+        if self.duplicates:
+            jobs.append(self.check_new_post_duplicates(thread))
+        await asyncio.gather(*jobs)
+
+    async def tag_new_post(self, thread: discord.Thread) -> None:
         try:
             await self.tagger.tag(thread.id)
         except (ClassificationError, discord.HTTPException) as exc:
             log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
-        if self.duplicates:
-            try:
-                await self.duplicates.check_new_post(thread)
-            except (EmbeddingError, discord.HTTPException) as exc:
-                log.warning("Thread %s duplicate check failed (%s)", thread.id, type(exc).__name__)
+
+    async def check_new_post_duplicates(self, thread: discord.Thread) -> None:
+        try:
+            await self.duplicates.check_new_post(thread)
+        except (EmbeddingError, discord.HTTPException) as exc:
+            log.warning("Thread %s duplicate check failed (%s)", thread.id, type(exc).__name__)
 
     def forget_deleted(self, thread_id: int) -> None:
         if self.duplicates and self.duplicates.index.remove(thread_id):
@@ -147,13 +160,13 @@ class ArtCraftBot(discord.Client):
             await interaction.response.send_message(message, ephemeral=True)
 
 
-@app_commands.guild_only()
-# Visible to members with Manage Threads; a server admin can narrow this further in
-# Server Settings > Integrations. The user allowlist below is enforced regardless.
-@app_commands.default_permissions(manage_threads=True)
-class TagCommands(
-    app_commands.Group, name="autotag", description="AI forum tagging for moderators"
-):
+class ModeratorGroup(app_commands.Group):
+    """Shared checks, thread lookup, and background forum runs for command groups.
+
+    Defines no commands itself: discord.py collects a group's commands only when its
+    base classes have none.
+    """
+
     def __init__(self, bot: ArtCraftBot):
         super().__init__()
         self.bot = bot
@@ -195,7 +208,9 @@ class TagCommands(
         target_id = await self.parse_thread_id(interaction, thread_id)
         if target_id is None:
             return None
-        log.info("/autotag %s by user %s on thread %s", command, interaction.user.id, target_id)
+        log.info(
+            "/%s %s by user %s on thread %s", self.name, command, interaction.user.id, target_id
+        )
         target = await self.bot.fetch_channel(target_id)
         if not isinstance(target, discord.Thread) or not self.can_manage(interaction, target):
             log.info("Thread %s refused: not a thread the user can manage", target_id)
@@ -206,6 +221,169 @@ class TagCommands(
             return None
         return target
 
+    async def check_forum(self, interaction: discord.Interaction, forum) -> bool:
+        """Allow an enabled forum the caller manages with no batch running, else reply."""
+        if forum.id not in self.bot.config.forum_channel_ids or not self.can_manage(
+            interaction, forum
+        ):
+            log.info("Forum %s refused: not enabled or user cannot manage it", forum.id)
+            await interaction.followup.send(
+                "Choose an enabled forum in this server where you have "
+                "View Channel and Manage Threads.",
+                ephemeral=True,
+            )
+            return False
+        if forum.id in self.running_batches:
+            await interaction.followup.send(
+                "A batch is already running for this forum.", ephemeral=True
+            )
+            return False
+        return True
+
+    async def run_workers(
+        self,
+        threads: list[discord.Thread],
+        handle: Callable[[discord.Thread], Awaitable[str]],
+        counts: dict[str, int],
+        should_stop: Callable[[], bool] = lambda: False,
+        progress: str | None = None,
+    ) -> None:
+        """Run handle over threads with parallel workers, roughly in order, counting
+        each returned status."""
+        pending = iter(threads)  # Shared: each worker takes the next unclaimed thread.
+
+        async def worker() -> None:
+            for thread in pending:
+                if should_stop():
+                    return
+                try:
+                    counts[await handle(thread)] += 1
+                except (ClassificationError, EmbeddingError, discord.HTTPException) as exc:
+                    counts["failed"] += 1
+                    log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
+                done = sum(counts.values())
+                if progress and done % 25 == 0:
+                    log.info("%s: %d/%d done", progress, done, len(threads))
+
+        async with asyncio.TaskGroup() as group:
+            for _ in range(self.bot.config.tag_concurrency):
+                group.create_task(worker())
+
+    async def start_full_run(
+        self,
+        interaction: discord.Interaction,
+        forum: discord.ForumChannel,
+        include_archived: bool,
+        handle: Callable[[discord.Thread], Awaitable[str]],
+        verb: str,
+        statuses: tuple[str, ...],
+    ) -> None:
+        """Start a background run over every post in a forum, newest first."""
+        self.running_batches.add(forum.id)
+        try:
+            active = [t for t in await forum.guild.active_threads() if t.parent_id == forum.id]
+            archived = (
+                [t async for t in forum.archived_threads(limit=None)] if include_archived else []
+            )
+        except BaseException:
+            self.running_batches.discard(forum.id)
+            raise
+        threads = sorted(active + archived, key=lambda thread: thread.id, reverse=True)
+        self.stop_requests.discard(forum.id)
+        self.full_runs[forum.id] = asyncio.create_task(
+            self.run_full(interaction, forum, threads, handle, verb, statuses)
+        )
+        log.info(
+            "Full %s run on forum %s started: %d posts (%d active, %d archived)",
+            verb,
+            forum.id,
+            len(threads),
+            len(active),
+            len(archived),
+        )
+        await interaction.followup.send(
+            f"Started {verb} {len(threads)} posts ({len(active)} active, "
+            f"{len(archived)} archived), newest first, "
+            f"{self.bot.config.tag_concurrency} at a time. New posts are still "
+            "handled meanwhile. I'll send the summary when done (by DM if it takes over "
+            f"15 minutes). Use `/{self.name} stop` to cancel.",
+            ephemeral=True,
+        )
+
+    async def run_full(
+        self,
+        interaction: discord.Interaction,
+        forum: discord.ForumChannel,
+        threads: list[discord.Thread],
+        handle: Callable[[discord.Thread], Awaitable[str]],
+        verb: str,
+        statuses: tuple[str, ...],
+    ) -> None:
+        counts = new_counts(statuses)
+        try:
+            await self.run_workers(
+                threads,
+                handle,
+                counts,
+                should_stop=lambda: forum.id in self.stop_requests,
+                progress=f"Full {verb} run on forum {forum.id}",
+            )
+        finally:
+            stopped = forum.id in self.stop_requests
+            self.running_batches.discard(forum.id)
+            self.stop_requests.discard(forum.id)
+            self.full_runs.pop(forum.id, None)
+        state = "stopped" if stopped else "finished"
+        done = sum(counts.values())
+        breakdown = ", ".join(f"{counts[key]} {key}" for key in statuses)
+        log.info(
+            "Full %s run on forum %s %s: %d/%d examined, %s",
+            verb,
+            forum.id,
+            state,
+            done,
+            len(threads),
+            breakdown,
+        )
+        await self.report(
+            interaction,
+            f"Full {verb} run on <#{forum.id}> {state}. "
+            f"Examined {done}/{len(threads)} posts: {breakdown}.",
+        )
+
+    async def request_stop(self, interaction: discord.Interaction, forum) -> None:
+        log.info("/%s stop by user %s on forum %s", self.name, interaction.user.id, forum.id)
+        if forum.id not in self.full_runs:
+            await interaction.response.send_message(
+                "No full run is active for this forum.", ephemeral=True
+            )
+            return
+        self.stop_requests.add(forum.id)
+        await interaction.response.send_message(
+            "Stopping after the current post; the summary follows.", ephemeral=True
+        )
+
+    async def report(self, interaction: discord.Interaction, message: str) -> None:
+        # Interaction follow-ups expire after 15 minutes; fall back to a DM.
+        try:
+            await interaction.followup.send(message, ephemeral=True)
+            return
+        except discord.HTTPException:
+            pass
+        try:
+            await interaction.user.send(message)
+        except discord.HTTPException:
+            log.warning("Could not deliver the summary to user %s", interaction.user.id)
+
+
+@app_commands.guild_only()
+# Visible to members with Manage Threads; a server admin can narrow this further in
+# Server Settings > Integrations. The user allowlist is enforced regardless.
+@app_commands.default_permissions(manage_threads=True)
+class TagCommands(ModeratorGroup, name="autotag", description="AI forum tagging for moderators"):
+    async def tag(self, thread: discord.Thread, include_archived: bool = False) -> str:
+        return (await self.bot.tagger.tag(thread.id, include_archived)).status
+
     @app_commands.command(name="thread", description="AI-tag this thread or a thread ID")
     @app_commands.describe(thread_id="Optional thread ID; defaults to the thread you are in")
     @app_commands.checks.has_permissions(manage_threads=True)
@@ -215,7 +393,7 @@ class TagCommands(
         if target is None:
             return
         try:
-            # Includes waiting for other tagging work, which runs one thread at a time.
+            # Includes waiting for a free slot when other tagging work is running.
             async with asyncio.timeout(60):
                 result = await self.bot.tagger.tag(target.id)
         except TimeoutError:
@@ -243,20 +421,7 @@ class TagCommands(
             forum.id,
             limit,
         )
-        if forum.id not in self.bot.config.forum_channel_ids or not self.can_manage(
-            interaction, forum
-        ):
-            log.info("Forum %s refused: not enabled or user cannot manage it", forum.id)
-            await interaction.followup.send(
-                "Choose an enabled forum in this server where you have "
-                "View Channel and Manage Threads.",
-                ephemeral=True,
-            )
-            return
-        if forum.id in self.running_batches:
-            await interaction.followup.send(
-                "A batch is already running for this forum.", ephemeral=True
-            )
+        if not await self.check_forum(interaction, forum):
             return
         self.running_batches.add(forum.id)
         counts = new_counts()
@@ -274,7 +439,7 @@ class TagCommands(
                 )
                 available = len(eligible)
                 selected = eligible[:limit]
-                await self.tag_threads(selected, counts)
+                await self.run_workers(selected, self.tag, counts)
         except TimeoutError:
             timed_out = True
         finally:
@@ -320,179 +485,96 @@ class TagCommands(
             forum.id,
             include_archived,
         )
-        if forum.id not in self.bot.config.forum_channel_ids or not self.can_manage(
-            interaction, forum
-        ):
-            log.info("Forum %s refused: not enabled or user cannot manage it", forum.id)
-            await interaction.followup.send(
-                "Choose an enabled forum in this server where you have "
-                "View Channel and Manage Threads.",
-                ephemeral=True,
-            )
+        if not await self.check_forum(interaction, forum):
             return
-        if forum.id in self.running_batches:
-            await interaction.followup.send(
-                "A batch is already running for this forum.", ephemeral=True
-            )
-            return
-        self.running_batches.add(forum.id)
-        try:
-            active = [t for t in await forum.guild.active_threads() if t.parent_id == forum.id]
-            archived = (
-                [t async for t in forum.archived_threads(limit=None)] if include_archived else []
-            )
-        except BaseException:
-            self.running_batches.discard(forum.id)
-            raise
-        threads = sorted(active + archived, key=lambda thread: thread.id, reverse=True)
-        self.stop_requests.discard(forum.id)
-        self.full_runs[forum.id] = asyncio.create_task(
-            self.run_all(interaction, forum, threads, include_archived)
-        )
-        log.info(
-            "Full run on forum %s started: %d posts (%d active, %d archived)",
-            forum.id,
-            len(threads),
-            len(active),
-            len(archived),
-        )
-        await interaction.followup.send(
-            f"Started tagging {len(threads)} posts ({len(active)} active, "
-            f"{len(archived)} archived), newest first, "
-            f"{self.bot.config.tag_concurrency} at a time. New posts are still "
-            "tagged meanwhile. I'll send the summary when done (by DM if it takes over "
-            "15 minutes). Use `/autotag stop` to cancel.",
-            ephemeral=True,
-        )
 
-    async def run_all(
-        self,
-        interaction: discord.Interaction,
-        forum: discord.ForumChannel,
-        threads: list[discord.Thread],
-        include_archived: bool,
-    ) -> None:
-        counts = new_counts()
-        indexed = 0
-        try:
-            indexed = await self.tag_threads(
-                threads,
-                counts,
-                include_archived,
-                should_stop=lambda: forum.id in self.stop_requests,
-                progress=f"Full run on forum {forum.id}",
-            )
-        finally:
-            stopped = forum.id in self.stop_requests
-            self.running_batches.discard(forum.id)
-            self.stop_requests.discard(forum.id)
-            self.full_runs.pop(forum.id, None)
-        completed, failed = sum(counts.values()), counts["failed"]
-        summary = (
-            f"Full run on <#{forum.id}> {'stopped' if stopped else 'finished'}. "
-            f"Examined {completed}/{len(threads)} posts: {counts['updated']} updated, "
-            f"{counts['unchanged']} unchanged, {counts['skipped']} skipped, {failed} failed."
+        async def handle(thread: discord.Thread) -> str:
+            return await self.tag(thread, include_archived)
+
+        await self.start_full_run(
+            interaction, forum, include_archived, handle, "tagging", TAG_STATUSES
         )
-        if self.bot.duplicates:
-            summary += f" {indexed} newly indexed for duplicate detection."
-        log.info(
-            "Full run on forum %s %s: %d/%d examined, %d updated, %d unchanged, "
-            "%d skipped, %d failed, %d indexed",
-            forum.id,
-            "stopped" if stopped else "finished",
-            completed,
-            len(threads),
-            counts["updated"],
-            counts["unchanged"],
-            counts["skipped"],
-            failed,
-            indexed,
-        )
-        await self.report(interaction, summary)
-
-    async def tag_threads(
-        self,
-        threads: list[discord.Thread],
-        counts: dict[str, int],
-        include_archived: bool = False,
-        should_stop: Callable[[], bool] = lambda: False,
-        progress: str | None = None,
-    ) -> int:
-        """Tag (and index, if enabled) threads with parallel workers, roughly newest
-        first, updating counts. Returns how many posts were added to the duplicate index."""
-        pending = iter(threads)  # Shared: each worker takes the next unclaimed thread.
-        duplicates = self.bot.duplicates
-        indexed = 0
-
-        async def worker() -> None:
-            nonlocal indexed
-            for thread in pending:
-                if should_stop():
-                    return
-                try:
-                    result = await self.bot.tagger.tag(thread.id, include_archived)
-                    counts[result.status] += 1
-                except (ClassificationError, discord.HTTPException) as exc:
-                    counts["failed"] += 1
-                    log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
-                if duplicates:
-                    # Indexes locked posts and forums without tags too; already
-                    # indexed posts are skipped, so re-runs cost nothing extra.
-                    try:
-                        indexed += await duplicates.index_post(thread)
-                    except (EmbeddingError, discord.HTTPException) as exc:
-                        log.warning("Thread %s indexing failed (%s)", thread.id, type(exc).__name__)
-                done = sum(counts.values())
-                if progress and done % 25 == 0:
-                    log.info("%s: %d/%d done", progress, done, len(threads))
-
-        async with asyncio.TaskGroup() as group:
-            for _ in range(self.bot.config.tag_concurrency):
-                group.create_task(worker())
-        return indexed
-
-    async def report(self, interaction: discord.Interaction, message: str) -> None:
-        # Interaction follow-ups expire after 15 minutes; fall back to a DM.
-        try:
-            await interaction.followup.send(message, ephemeral=True)
-            return
-        except discord.HTTPException:
-            pass
-        try:
-            await interaction.user.send(message)
-        except discord.HTTPException:
-            log.warning("Could not deliver the summary to user %s", interaction.user.id)
 
     @app_commands.command(name="stop", description="Stop a running /autotag all for a forum")
     @app_commands.describe(forum="Forum whose full run should stop")
     @app_commands.checks.has_permissions(manage_threads=True)
     async def stop(self, interaction: discord.Interaction, forum: discord.ForumChannel):
-        log.info("/autotag stop by user %s on forum %s", interaction.user.id, forum.id)
-        if forum.id not in self.full_runs:
-            await interaction.response.send_message(
-                "No full run is active for this forum.", ephemeral=True
+        await self.request_stop(interaction, forum)
+
+
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_threads=True)
+class DuplicateCommands(
+    ModeratorGroup, name="duplicates", description="Duplicate post detection for moderators"
+):
+    async def finder(self, interaction: discord.Interaction) -> DuplicateFinder | None:
+        """The duplicate finder, or None after telling the caller detection is off."""
+        if self.bot.duplicates is None:
+            await interaction.followup.send(
+                "Duplicate detection is off. Set DUPLICATES=on and DUPLICATE_DB_KEY in "
+                ".env, then restart the bot.",
+                ephemeral=True,
             )
-            return
-        self.stop_requests.add(forum.id)
-        await interaction.response.send_message(
-            "Stopping after the current post; the summary follows.", ephemeral=True
+        return self.bot.duplicates
+
+    @app_commands.command(
+        name="index", description="Index every post in a forum for duplicate detection"
+    )
+    @app_commands.describe(
+        forum="Enabled forum", include_archived="Also index archived posts (default: yes)"
+    )
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def index(
+        self,
+        interaction: discord.Interaction,
+        forum: discord.ForumChannel,
+        include_archived: bool = True,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        log.info(
+            "/duplicates index by user %s on forum %s (include archived: %s)",
+            interaction.user.id,
+            forum.id,
+            include_archived,
         )
+        finder = await self.finder(interaction)
+        if finder is None or not await self.check_forum(interaction, forum):
+            return
+        # Includes locked posts and forums without tags; already indexed posts are
+        # skipped, so re-runs only embed new posts. Full runs never reply in posts.
+        await self.start_full_run(
+            interaction, forum, include_archived, finder.index_post, "indexing", INDEX_STATUSES
+        )
+
+    @app_commands.command(name="stop", description="Stop a running /duplicates index for a forum")
+    @app_commands.describe(forum="Forum whose indexing run should stop")
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def stop(self, interaction: discord.Interaction, forum: discord.ForumChannel):
+        await self.request_stop(interaction, forum)
 
     @app_commands.command(
         name="similar", description="Show the posts most similar to this thread or a thread ID"
     )
-    @app_commands.describe(thread_id="Optional thread ID; defaults to the thread you are in")
+    @app_commands.describe(
+        thread_id="Optional thread ID; defaults to the thread you are in",
+        limit="How many posts to list (default 10)",
+    )
     @app_commands.checks.has_permissions(manage_threads=True)
-    async def similar(self, interaction: discord.Interaction, thread_id: str | None = None):
+    async def similar(
+        self,
+        interaction: discord.Interaction,
+        thread_id: str | None = None,
+        limit: app_commands.Range[int, 1, 25] = 10,
+    ):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        if not self.bot.duplicates:
-            await interaction.followup.send("Duplicate detection is off.", ephemeral=True)
+        finder = await self.finder(interaction)
+        if finder is None:
             return
         target = await self.resolve_thread(interaction, thread_id, "similar")
         if target is None:
             return
         try:
-            found = await self.bot.duplicates.similar_to(target)
+            found = await finder.similar_to(target, limit)
         except EmbeddingError as exc:
             log.warning("Thread %s similarity lookup failed (%s)", target.id, exc)
             await interaction.followup.send(
@@ -521,15 +603,15 @@ class TagCommands(
     @app_commands.checks.has_permissions(manage_threads=True)
     async def forget(self, interaction: discord.Interaction, thread_id: str):
         await interaction.response.defer(ephemeral=True, thinking=True)
-        if not self.bot.duplicates:
-            await interaction.followup.send("Duplicate detection is off.", ephemeral=True)
+        finder = await self.finder(interaction)
+        if finder is None:
             return
         target_id = await self.parse_thread_id(interaction, thread_id)
         if target_id is None:
             return
-        removed = self.bot.duplicates.index.exclude(target_id)
+        removed = finder.index.exclude(target_id)
         log.info(
-            "/autotag forget by user %s: thread %s excluded (data %s)",
+            "/duplicates forget by user %s: thread %s excluded (data %s)",
             interaction.user.id,
             target_id,
             "deleted" if removed else "was not stored",
