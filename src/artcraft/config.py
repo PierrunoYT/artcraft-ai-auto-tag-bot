@@ -36,6 +36,11 @@ class Config:
     duplicate_candidates: int = 10
     # Most AI-confirmed duplicates linked in a reply.
     duplicate_max_matches: int = 5
+    # "on": every post in a duplicate group lists the others (archived posts are
+    # briefly reopened); "active": skip archived posts; "off": only the new post.
+    duplicate_cross_link: Literal["on", "active", "off"] = "on"
+    # "all": compare posts across every configured forum; "forum": only within one.
+    duplicate_scope: Literal["all", "forum"] = "all"
     # Posts indexed at the same time; embeddings are cheap and fast, so this is
     # separate from (and higher than) TAG_CONCURRENCY.
     index_concurrency: int = 10
@@ -118,6 +123,12 @@ class Config:
                 raise ValueError
         except ValueError:
             raise ValueError("DUPLICATE_MAX_MATCHES must be an integer from 1 to 10") from None
+        cross_link = os.getenv("DUPLICATE_CROSS_LINK", "on").strip().lower()
+        if cross_link not in ("on", "active", "off"):
+            raise ValueError("DUPLICATE_CROSS_LINK must be 'on', 'active', or 'off'")
+        scope = os.getenv("DUPLICATE_SCOPE", "all").strip().lower()
+        if scope not in ("all", "forum"):
+            raise ValueError("DUPLICATE_SCOPE must be 'all' or 'forum'")
         try:
             index_concurrency = int(os.getenv("INDEX_CONCURRENCY", "10"))
             if not 1 <= index_concurrency <= 20:
@@ -141,5 +152,7 @@ class Config:
             duplicate_threshold=threshold,
             duplicate_candidates=candidates,
             duplicate_max_matches=max_matches,
+            duplicate_cross_link=cross_link,
+            duplicate_scope=scope,
             index_concurrency=index_concurrency,
         )

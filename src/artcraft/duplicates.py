@@ -10,7 +10,7 @@ import math
 import operator
 import sqlite3
 from array import array
-from collections.abc import Sequence
+from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 
 import discord
@@ -97,6 +97,17 @@ class DuplicateIndex:
             );
             -- Posts whose data was deleted on request; never indexed again.
             CREATE TABLE IF NOT EXISTS excluded (thread_id INTEGER PRIMARY KEY);
+            -- Cross-linked duplicate posts, stored in both directions.
+            CREATE TABLE IF NOT EXISTS related (
+                thread_id INTEGER NOT NULL,
+                related_id INTEGER NOT NULL,
+                PRIMARY KEY (thread_id, related_id)
+            );
+            -- The bot's "Related posts" message in each cross-linked post.
+            CREATE TABLE IF NOT EXISTS notices (
+                thread_id INTEGER PRIMARY KEY,
+                message_id INTEGER NOT NULL
+            );
             """
         )
         # Vectors from another model are not comparable; drop them.
@@ -166,11 +177,55 @@ class DuplicateIndex:
         stale = [t for t, f in self.forum_of.items() if f not in forum_ids]
         for thread_id in stale:
             self.remove(thread_id)
+            self.unrelate(thread_id)
+            self.drop_notice(thread_id)
         return len(stale)
 
-    def candidates(self, forum_id: int, exclude: int) -> list[tuple[int, array]]:
+    def relate(self, thread_ids: Sequence[int]) -> None:
+        """Mark every listed post as related to every other one."""
+        pairs = [(a, b) for a in thread_ids for b in thread_ids if a != b]
+        self.db.executemany("INSERT OR IGNORE INTO related VALUES (?, ?)", pairs)
+        self.db.commit()
+
+    def related(self, thread_id: int) -> list[int]:
+        """Posts related to a post, newest first."""
+        rows = self.db.execute(
+            "SELECT related_id FROM related WHERE thread_id = ? ORDER BY related_id DESC",
+            (thread_id,),
+        )
+        return [row[0] for row in rows]
+
+    def unrelate(self, thread_id: int) -> list[int]:
+        """Remove a post from all relations; returns the posts it was related to."""
+        former = self.related(thread_id)
+        self.db.execute(
+            "DELETE FROM related WHERE thread_id = ? OR related_id = ?", (thread_id, thread_id)
+        )
+        self.db.commit()
+        return former
+
+    def notice(self, thread_id: int) -> int | None:
+        row = self.db.execute(
+            "SELECT message_id FROM notices WHERE thread_id = ?", (thread_id,)
+        ).fetchone()
+        return row[0] if row else None
+
+    def set_notice(self, thread_id: int, message_id: int) -> None:
+        self.db.execute("INSERT OR REPLACE INTO notices VALUES (?, ?)", (thread_id, message_id))
+        self.db.commit()
+
+    def drop_notice(self, thread_id: int) -> None:
+        self.db.execute("DELETE FROM notices WHERE thread_id = ?", (thread_id,))
+        self.db.commit()
+
+    def candidates(self, forum_ids: Iterable[int], exclude: int) -> list[tuple[int, array]]:
         # A snapshot, so ranking can run off the event loop while the index changes.
-        return [(t, v) for t, v in self.forums.get(forum_id, {}).items() if t != exclude]
+        return [
+            (t, v)
+            for forum_id in forum_ids
+            for t, v in self.forums.get(forum_id, {}).items()
+            if t != exclude
+        ]
 
     def close(self) -> None:
         self.db.close()
@@ -191,6 +246,131 @@ def post_link(guild_id: int, match: Match) -> str:
     return f"[{title}](https://discord.com/channels/{guild_id}/{match.thread_id})"
 
 
+MAX_NOTICE_LINKS = 10
+
+
+class CrossLinker:
+    """Keeps one "Related posts" message in each cross-linked post, listing all the
+    others, and edits it as the group changes so old posts are not spammed."""
+
+    def __init__(self, client: discord.Client, index: DuplicateIndex, config: Config):
+        self.client = client
+        self.index = index
+        self.config = config
+        self._locks: dict[int, asyncio.Lock] = {}
+
+    async def link(self, new_id: int, duplicate_ids: list[int]) -> None:
+        """Relate a new post to its confirmed duplicates (and them to each other),
+        then update the notices."""
+        group = [new_id, *duplicate_ids]
+        self.index.relate(group)
+        targets = group if self.config.duplicate_cross_link != "off" else [new_id]
+        for thread_id in targets:
+            await self.refresh(thread_id)
+
+    async def forget(self, thread_id: int) -> None:
+        """Drop a post from its group (deleted, or on request) and update the others."""
+        affected = self.index.unrelate(thread_id)
+        self.index.drop_notice(thread_id)
+        self.index.remove(thread_id)
+        for other in affected:
+            await self.refresh(other)
+
+    async def refresh(self, thread_id: int) -> None:
+        lock = self._locks.setdefault(thread_id, asyncio.Lock())
+        async with lock:
+            gone = await self._refresh(thread_id)
+        if gone:
+            log.info("Thread %s no longer exists; removed from its duplicate group", thread_id)
+            await self.forget(thread_id)
+
+    async def _titles(self, thread_ids: list[int]) -> list[Match]:
+        """Live titles of related posts; posts deleted on Discord are dropped here and
+        their other links are fixed the next time those posts are refreshed."""
+        found = []
+        for thread_id in thread_ids:
+            try:
+                other = await self.client.fetch_channel(thread_id)
+            except discord.NotFound:
+                other = None
+            except discord.HTTPException:
+                continue
+            if not isinstance(other, discord.Thread):
+                self.index.unrelate(thread_id)
+                self.index.drop_notice(thread_id)
+                self.index.remove(thread_id)
+                continue
+            found.append(Match(thread_id, other.name, 0.0, True))
+        return found
+
+    def _content(self, guild_id: int, related: list[Match]) -> str | None:
+        if not related:
+            return None
+        shown = related[:MAX_NOTICE_LINKS]
+        lines = "\n".join(f"• {post_link(guild_id, m)}" for m in shown)
+        more = len(related) - len(shown)
+        extra = f"\n…and {more} more." if more else ""
+        return (
+            f"🔁 Related posts (found automatically):\n{lines}{extra}\n\n"
+            "If one of these covers the same request, consider continuing there."
+        )
+
+    async def _refresh(self, thread_id: int) -> bool:
+        """Create, edit, or delete a post's notice; True if the post no longer exists."""
+        try:
+            thread = await self.client.fetch_channel(thread_id)
+        except discord.NotFound:
+            return True
+        if not isinstance(thread, discord.Thread) or thread.locked:
+            return False  # Never post in locked threads.
+        message_id = self.index.notice(thread_id)
+        if message_id == 0:
+            return False  # A moderator deleted the notice; respect that.
+        if thread.archived and message_id is None and self.config.duplicate_cross_link == "active":
+            return False
+        forum = thread.parent
+        if forum is None or not forum.permissions_for(thread.guild.me).send_messages_in_threads:
+            log.warning("Thread %s: missing Send Messages in Threads; no notice", thread_id)
+            return False
+        content = self._content(thread.guild.id, await self._titles(self.index.related(thread_id)))
+        if content is None and message_id is None:
+            return False
+        reopened = thread.archived
+        if reopened:
+            # Discord only allows messages in unarchived threads; restore afterwards.
+            await thread.edit(archived=False, reason="ArtCraft duplicate cross-link")
+        try:
+            await self._write(thread, message_id, content)
+        finally:
+            if reopened:
+                try:
+                    await thread.edit(archived=True, reason="ArtCraft duplicate cross-link")
+                except discord.HTTPException:
+                    log.warning("Thread %s could not be re-archived", thread_id)
+        return False
+
+    async def _write(self, thread: discord.Thread, message_id: int | None, content: str | None):
+        none = discord.AllowedMentions.none()
+        if message_id is not None:
+            message = thread.get_partial_message(message_id)
+            try:
+                if content is None:
+                    await message.delete()
+                    self.index.drop_notice(thread.id)
+                    log.info("Thread %s: related-posts notice removed", thread.id)
+                else:
+                    await message.edit(content=content, allowed_mentions=none)
+                    log.info("Thread %s: related-posts notice updated", thread.id)
+            except discord.NotFound:
+                # Deleted by a moderator: remember that and do not post again.
+                self.index.set_notice(thread.id, 0)
+                log.info("Thread %s: notice was deleted; not reposting", thread.id)
+            return
+        sent = await thread.send(content, allowed_mentions=none)
+        self.index.set_notice(thread.id, sent.id)
+        log.info("Thread %s: related-posts notice posted", thread.id)
+
+
 class DuplicateFinder:
     def __init__(
         self,
@@ -208,6 +388,7 @@ class DuplicateFinder:
         # Caps concurrent embedding requests (INDEX_CONCURRENCY), separately from tagging.
         self.slots = slots
         self.judge = judge
+        self.links = CrossLinker(client, index, config)
 
     async def _read_post(
         self, thread: discord.Thread, retry_delays: Sequence[float] = ()
@@ -258,7 +439,11 @@ class DuplicateFinder:
     async def shortlist(
         self, forum_id: int, thread_id: int, vector: array, floor: float, limit: int
     ) -> list[tuple[int, float]]:
-        candidates = self.index.candidates(forum_id, exclude=thread_id)
+        # "all" compares posts across every configured forum; "forum" only within one.
+        scope = (
+            self.config.forum_channel_ids if self.config.duplicate_scope == "all" else {forum_id}
+        )
+        candidates = self.index.candidates(scope, exclude=thread_id)
         return await asyncio.to_thread(rank, candidates, vector, floor, limit)
 
     async def _load(self, thread_id: int) -> tuple[str, str] | None:
@@ -277,12 +462,25 @@ class DuplicateFinder:
         text = await posts.starter_text(thread)
         return thread.name[:256], (text or "")[:1000]
 
+    async def _load_cached(self, thread_id: int, cache: dict | None) -> tuple[str, str] | None:
+        # Forum-wide runs see each post as a candidate many times; read it once.
+        # The cache lives only in memory for the duration of the run.
+        if cache is None:
+            return await self._load(thread_id)
+        if thread_id not in cache:
+            cache[thread_id] = await self._load(thread_id)
+        return cache[thread_id]
+
     async def confirm(
-        self, title: str, body: str, shortlist: list[tuple[int, float]]
+        self,
+        title: str,
+        body: str,
+        shortlist: list[tuple[int, float]],
+        cache: dict | None = None,
     ) -> list[Match]:
         """Shortlisted posts that still exist, AI-confirmed duplicates first (in the
         model's order), then the rest by similarity."""
-        loaded = await asyncio.gather(*(self._load(t) for t, _ in shortlist))
+        loaded = await asyncio.gather(*(self._load_cached(t, cache) for t, _ in shortlist))
         live = {t: post for (t, _), post in zip(shortlist, loaded, strict=True) if post}
         if not live:
             return []
@@ -301,6 +499,22 @@ class DuplicateFinder:
         if embedded is None:
             return []
         vector, title, body = embedded
+        # Index first: a failed AI check must not leave the new post unindexed.
+        self.index.add(thread.id, thread.parent_id, vector)
+        found = await self._duplicates_of(thread, title, body, vector)
+        if found:
+            await self.links.link(thread.id, [m.thread_id for m in found])
+        return found
+
+    async def _duplicates_of(
+        self,
+        thread: discord.Thread,
+        title: str,
+        body: str,
+        vector: array,
+        cache: dict | None = None,
+    ) -> list[Match]:
+        """AI-confirmed duplicates of a post, most relevant first, capped for replies."""
         shortlist = await self.shortlist(
             thread.parent_id,
             thread.id,
@@ -308,11 +522,10 @@ class DuplicateFinder:
             self.config.duplicate_threshold,
             self.config.duplicate_candidates,
         )
-        self.index.add(thread.id, thread.parent_id, vector)
         if not shortlist:
             log.info("Thread %s: no similar posts", thread.id)
             return []
-        found = [m for m in await self.confirm(title, body, shortlist) if m.confirmed]
+        found = [m for m in await self.confirm(title, body, shortlist, cache) if m.confirmed]
         found = found[: self.config.duplicate_max_matches]
         if not found:
             log.info("Thread %s: %d candidates, none confirmed", thread.id, len(shortlist))
@@ -322,7 +535,29 @@ class DuplicateFinder:
             thread.id,
             ", ".join(f"{m.thread_id} ({m.score:.2f})" for m in found),
         )
-        await self._reply(thread, found)
+        return found
+
+    async def find(self, thread: discord.Thread, cache: dict | None = None) -> list[Match]:
+        """AI-confirmed duplicates of an existing post, indexing it first if needed.
+        Posts nothing; `cache` shares candidate text across a forum-wide run."""
+        if thread.parent_id not in self.config.forum_channel_ids:
+            return []
+        if thread.id in self.index.excluded:
+            return []
+        post = await self._read_post(thread)
+        if post is None:
+            return []
+        vector = self.index.get(thread.id)
+        if vector is None:
+            vector = await self._embed(*post)
+            self.index.add(thread.id, thread.parent_id, vector)
+        return await self._duplicates_of(thread, *post, vector, cache)
+
+    async def link_post(self, thread: discord.Thread) -> list[Match]:
+        """Run the new-post check on an existing post and cross-link its group."""
+        found = await self.find(thread)
+        if found:
+            await self.links.link(thread.id, [m.thread_id for m in found])
         return found
 
     async def review(self, thread: discord.Thread, limit: int = 10) -> list[Match]:
@@ -337,15 +572,3 @@ class DuplicateFinder:
         if not shortlist:
             return []
         return await self.confirm(*post, shortlist)
-
-    async def _reply(self, thread: discord.Thread, found: list[Match]) -> None:
-        forum = self.client.get_channel(thread.parent_id)
-        if forum is None or not forum.permissions_for(thread.guild.me).send_messages_in_threads:
-            log.warning("Thread %s: missing Send Messages in Threads; no reply sent", thread.id)
-            return
-        lines = "\n".join(f"• {post_link(thread.guild.id, m)}" for m in found)
-        await thread.send(
-            f"🔁 Possibly related posts:\n{lines}\n\n"
-            "If one of these covers your post, consider adding to it there.",
-            allowed_mentions=discord.AllowedMentions.none(),
-        )

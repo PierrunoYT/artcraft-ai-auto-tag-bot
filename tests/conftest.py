@@ -116,6 +116,9 @@ async def world(monkeypatch):
         judge_status=200,
         vectors={},  # Post title -> embedding returned by the fake model.
         sent=[],  # (channel_id, payload) for messages the bot sends.
+        messages={},  # Message ID -> current content of the bot's live messages.
+        edited=[],  # (channel_id, message_id, payload) for message edits.
+        removed_messages=[],  # (channel_id, message_id) for deleted messages.
         deleted_starters=set(),
         lagging_starters={},  # Thread ID -> fetches that 404 before the starter appears.
     )
@@ -169,13 +172,12 @@ async def world(monkeypatch):
         forum_threads = [t for t in threads(True) if t["parent_id"] == str(channel_id)]
         return {"threads": forum_threads, "members": [], "has_more": False}
 
-    async def send_message(channel_id, *, params):
-        world.sent.append((channel_id, params.payload))
+    def bot_message(message_id, channel_id, content):
         return {
-            "id": "900",
+            "id": str(message_id),
             "channel_id": str(channel_id),
             "type": 0,
-            "content": params.payload["content"],
+            "content": content,
             "author": {"id": "1", "username": "ArtCraft", "discriminator": "0", "avatar": None},
             "attachments": [],
             "embeds": [],
@@ -188,7 +190,33 @@ async def world(monkeypatch):
             "edited_timestamp": None,
         }
 
+    def assert_writable(channel_id):
+        # Like Discord: messages cannot be sent or changed in archived threads.
+        assert not world.channels[channel_id]["thread_metadata"]["archived"], "archived"
+
+    async def send_message(channel_id, *, params):
+        assert_writable(channel_id)
+        world.sent.append((channel_id, params.payload))
+        message_id = 900 + len(world.sent)
+        world.messages[message_id] = params.payload["content"]
+        return bot_message(message_id, channel_id, params.payload["content"])
+
+    async def edit_message(channel_id, message_id, *, params):
+        assert_writable(channel_id)
+        if message_id not in world.messages:
+            raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "")
+        world.edited.append((channel_id, message_id, params.payload))
+        world.messages[message_id] = params.payload["content"]
+        return bot_message(message_id, channel_id, params.payload["content"])
+
+    async def delete_message(channel_id, message_id, *, reason=None):
+        assert_writable(channel_id)
+        world.messages.pop(message_id, None)
+        world.removed_messages.append((channel_id, message_id))
+
     monkeypatch.setattr(bot.http, "send_message", send_message)
+    monkeypatch.setattr(bot.http, "edit_message", edit_message)
+    monkeypatch.setattr(bot.http, "delete_message", delete_message)
     monkeypatch.setattr(bot.http, "get_public_archived_threads", archived_threads)
     monkeypatch.setattr(bot.http, "get_channel", get_channel)
     monkeypatch.setattr(bot.http, "edit_channel", edit_channel)

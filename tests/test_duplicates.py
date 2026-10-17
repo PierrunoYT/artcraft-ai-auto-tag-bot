@@ -1,3 +1,4 @@
+import dataclasses
 import json
 import logging
 import sqlite3
@@ -19,6 +20,10 @@ def add_thread(world, thread_id, name, **metadata):
     world.channels[thread_id] = deepcopy(world.channels[200])
     world.channels[thread_id].update(id=str(thread_id), name=name)
     world.channels[thread_id]["thread_metadata"].update(metadata)
+
+
+def sent_to(world, channel_id):
+    return [payload for channel, payload in world.sent if channel == channel_id]
 
 
 def read_bytes(path):
@@ -48,8 +53,7 @@ async def test_new_post_gets_a_reply_linking_similar_posts_and_is_indexed(world,
     assert await index(world, duplicates, 202) == "indexed"
     await world.bot.on_thread_create(await world.bot.fetch_channel(200))
 
-    [(channel_id, payload)] = world.sent
-    assert channel_id == 200
+    [payload] = sent_to(world, 200)
     assert "[Export loses gradients](https://discord.com/channels/10/201)" in payload["content"]
     assert (
         "https://discord.com/channels/10/202" not in payload["content"]
@@ -79,10 +83,13 @@ async def test_reply_lists_up_to_the_configured_number_of_matches(world, duplica
     for offset in range(7):
         await index(world, duplicates, 201 + offset)
     await world.bot.on_thread_create(await world.bot.fetch_channel(200))
-    [(_, payload)] = world.sent
+    [payload] = sent_to(world, 200)
     links = [line for line in payload["content"].splitlines() if line.startswith("•")]
     assert duplicates.config.duplicate_max_matches == 5
-    assert [line.split("/")[-1].rstrip(")") for line in links] == [str(t) for t in range(201, 206)]
+    # The five most similar of seven candidates, listed newest first.
+    assert [line.split("/")[-1].rstrip(")") for line in links] == [
+        str(t) for t in range(205, 200, -1)
+    ]
 
 
 async def test_tagging_failure_does_not_block_the_duplicate_check(world, duplicates):
@@ -92,7 +99,7 @@ async def test_tagging_failure_does_not_block_the_duplicate_check(world, duplica
     world.status = 503  # Classification fails.
     await world.bot.on_thread_create(await world.bot.fetch_channel(200))
     assert world.writes == []
-    assert len(world.sent) == 1
+    assert len(sent_to(world, 200)) == 1
 
 
 async def test_duplicate_failure_does_not_block_tagging(world, duplicates):
@@ -377,19 +384,22 @@ async def test_candidate_with_a_deleted_starter_is_checked_by_title(world, dupli
     await world.bot.on_thread_create(await world.bot.fetch_channel(200))
     data = json.loads(world.judge_requests[0]["messages"][1]["content"])
     assert data["candidates"] == [{"id": "201", "title": "Export loses gradients", "body": ""}]
-    assert len(world.sent) == 1
+    assert len(sent_to(world, 200)) == 1
 
 
-async def test_reply_follows_the_ai_order(world, duplicates):
+async def test_ai_ranking_decides_which_duplicates_fit_the_reply(world, duplicates):
     for offset, title in enumerate(["Gradient bug one", "Gradient bug two"]):
         add_thread(world, 201 + offset, title)
         world.vectors[title] = [1.0, 0.05 * offset, 0.0]
         await index(world, duplicates, 201 + offset)
     world.vectors["My digital painting"] = [1.0, 0.0, 0.0]
     world.judge = ["202", "201"]  # The AI ranks the less similar post first.
-    await world.bot.on_thread_create(await world.bot.fetch_channel(200))
-    content = world.sent[0][1]["content"]
-    assert content.index("Gradient bug two") < content.index("Gradient bug one")
+    duplicates.config = dataclasses.replace(duplicates.config, duplicate_max_matches=1)
+    found = await duplicates.check_new_post(await world.bot.fetch_channel(200))
+    assert [m.thread_id for m in found] == [202]
+    [payload] = sent_to(world, 200)
+    assert "Gradient bug two" in payload["content"]
+    assert "Gradient bug one" not in payload["content"]
 
 
 async def test_similar_command_stays_within_discords_message_limit(world, duplicates, interaction):

@@ -13,7 +13,7 @@ def test_tagging_and_duplicate_commands_are_separate_groups(world):
     autotag = {c.name for c in world.bot.tree.get_command("autotag").commands}
     duplicates = {c.name for c in world.bot.tree.get_command("duplicates").commands}
     assert autotag == {"thread", "active", "all", "stop"}
-    assert duplicates == {"index", "stop", "similar", "forget"}
+    assert duplicates == {"index", "stop", "similar", "forget", "link", "link_all"}
 
 
 @pytest.mark.parametrize("name", ["autotag", "duplicates"])

@@ -11,9 +11,11 @@ use of the bot, not a grant of a software license or a promise of hosted service
 
 The bot classifies new forum posts and provides moderator commands to reclassify
 individual posts, batches of active posts, or every post in a forum, including
-archived posts. If the operator enables duplicate detection, the bot also replies in
-new posts with links to similar earlier posts in the same forum. These suggestions
-are automated and may be wrong; a suggested post is not necessarily a duplicate.
+archived posts. If the operator enables duplicate detection, the bot also posts a
+"Related posts" message in new posts and, depending on configuration, in the
+earlier posts they match, linking them to each other; archived earlier posts may be
+briefly reopened to do so. These suggestions are automated and may be wrong; a
+linked post is not necessarily a duplicate.
 
 ## Server administration and acceptable use
 

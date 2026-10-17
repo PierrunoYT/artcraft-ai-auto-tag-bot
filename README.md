@@ -81,6 +81,8 @@ and use URLs for your own deployment. See also the official
 | `DUPLICATE_THRESHOLD` | No | `0.45`, from 0.2 to 0.95; minimum embedding similarity to shortlist a candidate for the AI check |
 | `DUPLICATE_CANDIDATES` | No | `10`, from 1 to 25; candidates shortlisted per new post |
 | `DUPLICATE_MAX_MATCHES` | No | `5`, from 1 to 10; most AI-confirmed duplicates linked in a reply |
+| `DUPLICATE_CROSS_LINK` | No | `on` (every post in a group lists the others), `active` (skip archived posts), or `off` (new post only) |
+| `DUPLICATE_SCOPE` | No | `all` (compare posts across every forum in `FORUM_CHANNEL_IDS`) or `forum` (only within the same forum) |
 | `INDEX_CONCURRENCY` | No | `10`, from 1 to 20; posts indexed at the same time |
 | `EMBEDDING_MODEL` | No | `openai/text-embedding-3-small`; must have a ZDR endpoint |
 
@@ -142,6 +144,17 @@ These reply "Duplicate detection is off" unless `DUPLICATES=on`.
   shortlist floor are labeled. Useful for checking detection quality.
 - **`/duplicates forget thread_id:<id>`** — delete a post's stored duplicate data and
   never index it again, for example on a member's deletion request.
+- **`/duplicates link [thread_id]`** — run the new-post check on one existing post
+  and, if duplicates are confirmed, cross-link the group (posting or updating
+  notices). Good for testing on a single post.
+- **`/duplicates link_all forum:<forum> mode:<preview|post>`** — run the check for
+  every indexed post in a forum in the background (`INDEX_CONCURRENCY` at a time,
+  with `/duplicates stop`). `preview` posts and stores nothing and reports the
+  groups it found with titled links. `post` first finds all groups, then writes
+  each post's notice once. Stopping before the end posts nothing. Costs about
+  $0.0005 per post (roughly $1.40 for 2,750 posts); each candidate is read from
+  Discord once per run and kept only in memory. Linking an archived post bumps it
+  once; consider `DUPLICATE_CROSS_LINK=active` to leave archived posts alone.
 
 Each group allows one batch or full run per forum at a time; a tagging run and an
 indexing run can run side by side. Tagging uses `TAG_CONCURRENCY` (default 4) and
@@ -207,23 +220,38 @@ the index. Update your Privacy Policy and tell members before enabling it.
 - **New posts:** detection works in two steps.
   1. **Shortlist:** the title and up to 6,000 characters of the starter message are
      turned into an embedding (via OpenRouter, with the same ZDR routing) and
-     compared with other posts in the same forum. Up to `DUPLICATE_CANDIDATES`
-     posts scoring at least `DUPLICATE_THRESHOLD` are shortlisted.
+     compared with other indexed posts: by default in every configured forum, so
+     an app request can match a feedback post (`DUPLICATE_SCOPE=forum` limits this
+     to the same forum). Up to `DUPLICATE_CANDIDATES` posts scoring at least
+     `DUPLICATE_THRESHOLD` are shortlisted. Groups can span forums, and each post's
+     notice links to posts in either forum.
   2. **AI check:** the bot reads each candidate's title and up to 1,000 characters
      of its starter live from Discord (nothing extra is stored) and asks
      `OPENROUTER_MODEL`, with the same ZDR routing and strict structured output,
      which candidates ask for or report the same thing. Related but different
      requests are rejected.
 
-  The bot replies in the post with titled links to the confirmed duplicates (up to
-  `DUPLICATE_MAX_MATCHES`), then adds the post to the index. Mentions are disabled.
-  If the AI check fails, no reply is sent. Candidates whose post no longer exists
-  are dropped and removed from the index. This costs one AI call per new post with
-  candidates, about $0.0005.
+  The new post and its confirmed duplicates (up to `DUPLICATE_MAX_MATCHES`) form a
+  group. If the AI check fails, nothing is posted. Candidates whose post no longer
+  exists are dropped and removed from the index. This costs one AI call per new post
+  with candidates, about $0.0005.
+- **Cross-linking:** every post in a group gets one "🔁 Related posts" message from
+  the bot listing all the others with their live titles, newest first (up to 10,
+  then "…and N more"). When the group grows, the bot **edits** its existing
+  message instead of posting again, so older posts are not spammed. Archived posts
+  are unarchived, updated, and archived again; posting a post's first notice
+  bumps it once in "recent activity", later edits do not. Locked posts are never
+  posted in. If a moderator deletes a notice, the bot does not post it again in
+  that post. Deleting a post removes it from the other posts' notices, and a notice
+  with nothing left to list is deleted. Mentions are disabled. Set
+  `DUPLICATE_CROSS_LINK=active` to leave archived posts alone, or `off` to post only
+  in the new post. Existing posts are cross-linked when a new duplicate arrives or
+  through `/duplicates link` and `/duplicates link_all`; indexing never posts.
 - **Existing posts:** run `/duplicates index` once per forum to build the index.
 - **Stored data:** per post, only the post ID, forum ID, embedding model name, and
-  the embedding vector, encrypted with `DUPLICATE_DB_KEY`. No titles, text,
-  usernames, or author IDs. Embeddings are derived from post text, so treat the file
+  the embedding vector, encrypted with `DUPLICATE_DB_KEY`; for cross-linking, which
+  post IDs are related and the ID of the bot's notice message in each. No titles,
+  text, usernames, or author IDs. Embeddings are derived from post text, so treat the file
   as personal data.
 - **Kept in sync:** deleting a post on Discord deletes its entry. Deleting its
   starter message replaces the entry with one computed from the title alone (or

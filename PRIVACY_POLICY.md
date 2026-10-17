@@ -33,9 +33,10 @@ message text and tag names may themselves contain personal information.
 If the operator enables duplicate detection, the same title and starter text are
 also sent to OpenRouter to compute an embedding (a list of numbers representing the
 post's meaning). The purpose is to point authors of new posts to similar earlier
-posts. Embeddings are compared only with posts in the same forum. To confirm
-matches, the titles and up to 1,000 characters of the starter messages of up to 25
-similar earlier posts in the same forum are read from Discord when a new post
+posts. Embeddings are compared with posts in the bot's configured forums (or only
+the same forum, if the operator chooses). To confirm matches, the titles and up to
+1,000 characters of the starter messages of up to 25 similar earlier posts from
+those forums are read from Discord when a new post
 arrives and sent to OpenRouter, with the same zero-data-retention routing, together
 with the new post. This text is used only for that check and is not stored.
 
@@ -73,7 +74,9 @@ data is used transiently in memory rather than kept as an application history.
 
 If duplicate detection is enabled, the bot stores, for each indexed post: the post
 (thread) ID, the forum ID, the embedding model name, and the post's embedding,
-encrypted at rest. It does not store titles, message text, usernames, or author IDs.
+encrypted at rest. To cross-link duplicates, it also stores which post IDs were
+found to be related and the message ID of its "Related posts" notice in each post.
+It does not store titles, message text, usernames, or author IDs.
 The post ID links an entry to the Discord post, so this data is pseudonymous, not
 anonymous, and is treated as personal data. An entry is deleted when the post is
 deleted on Discord, when its forum is removed from the bot's configuration, or on

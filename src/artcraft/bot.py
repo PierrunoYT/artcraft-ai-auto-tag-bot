@@ -1,6 +1,7 @@
 import asyncio
 import logging
 from collections.abc import Awaitable, Callable
+from typing import Literal
 
 import discord
 import httpx
@@ -8,13 +9,21 @@ from discord import app_commands
 
 from .classifier import ClassificationError, Classifier, DuplicateJudge
 from .config import Config
-from .duplicates import DuplicateFinder, DuplicateIndex, Embedder, EmbeddingError, post_link
+from .duplicates import (
+    DuplicateFinder,
+    DuplicateIndex,
+    Embedder,
+    EmbeddingError,
+    Match,
+    post_link,
+)
 from .tagging import Tagger
 
 log = logging.getLogger(__name__)
 
 TAG_STATUSES = ("updated", "unchanged", "skipped", "failed")
 INDEX_STATUSES = ("indexed", "unchanged", "skipped", "failed")
+LINK_STATUSES = ("grouped", "unique", "skipped", "failed")
 
 
 def new_counts(keys: tuple[str, ...] = TAG_STATUSES) -> dict[str, int]:
@@ -100,12 +109,17 @@ class ArtCraftBot(discord.Client):
             # A failed AI check never produces a reply; the post is still indexed.
             log.warning("Thread %s duplicate check failed (%s)", thread.id, type(exc).__name__)
 
-    def forget_deleted(self, thread_id: int) -> None:
-        if self.duplicates and self.duplicates.index.remove(thread_id):
-            log.info("Thread %s removed from the duplicate index (deleted on Discord)", thread_id)
-
     async def on_raw_thread_delete(self, payload: discord.RawThreadDeleteEvent) -> None:
-        self.forget_deleted(payload.thread_id)
+        if not self.duplicates:
+            return
+        thread_id = payload.thread_id
+        if thread_id in self.duplicates.index:
+            log.info("Thread %s removed from the duplicate index (deleted on Discord)", thread_id)
+        try:
+            # Also drops it from its duplicate group and updates the others' notices.
+            await self.duplicates.links.forget(thread_id)
+        except discord.HTTPException as exc:
+            log.warning("Thread %s: updating related notices failed (%s)", thread_id, exc.status)
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         if payload.message_id == payload.channel_id:  # A forum post's starter message.
@@ -295,8 +309,11 @@ class ModeratorGroup(app_commands.Group):
         verb: str,
         statuses: tuple[str, ...],
         workers: int,
+        finish: Callable[[bool], Awaitable[str]] | None = None,
     ) -> None:
-        """Start a background run over every post in a forum, newest first."""
+        """Start a background run over every post in a forum, newest first. `finish`
+        runs after the posts (given whether the run was stopped) and returns text
+        appended to the summary."""
         self.running_batches.add(forum.id)
         try:
             active = [t for t in await forum.guild.active_threads() if t.parent_id == forum.id]
@@ -309,7 +326,7 @@ class ModeratorGroup(app_commands.Group):
         threads = sorted(active + archived, key=lambda thread: thread.id, reverse=True)
         self.stop_requests.discard(forum.id)
         self.full_runs[forum.id] = asyncio.create_task(
-            self.run_full(interaction, forum, threads, handle, verb, statuses, workers)
+            self.run_full(interaction, forum, threads, handle, verb, statuses, workers, finish)
         )
         log.info(
             "Full %s run on forum %s started: %d posts (%d active, %d archived)",
@@ -337,8 +354,10 @@ class ModeratorGroup(app_commands.Group):
         verb: str,
         statuses: tuple[str, ...],
         workers: int,
+        finish: Callable[[bool], Awaitable[str]] | None = None,
     ) -> None:
         counts = new_counts(statuses)
+        extra = ""
         try:
             await self.run_workers(
                 threads,
@@ -348,6 +367,9 @@ class ModeratorGroup(app_commands.Group):
                 should_stop=lambda: forum.id in self.stop_requests,
                 progress=f"Full {verb} run on forum {forum.id}",
             )
+            stopped = forum.id in self.stop_requests
+            if finish:
+                extra = " " + await finish(stopped)
         finally:
             stopped = forum.id in self.stop_requests
             self.running_batches.discard(forum.id)
@@ -368,7 +390,7 @@ class ModeratorGroup(app_commands.Group):
         await self.report(
             interaction,
             f"Full {verb} run on <#{forum.id}> {state}. "
-            f"Examined {done}/{len(threads)} posts: {breakdown}.",
+            f"Examined {done}/{len(threads)} posts: {breakdown}.{extra}",
         )
 
     async def request_stop(self, interaction: discord.Interaction, forum) -> None:
@@ -384,6 +406,8 @@ class ModeratorGroup(app_commands.Group):
         )
 
     async def report(self, interaction: discord.Interaction, message: str) -> None:
+        if len(message) > 2000:  # Discord's message limit.
+            message = message[:1990].rsplit("\n", 1)[0] + "\n…"
         # Interaction follow-ups expire after 15 minutes; fall back to a DM.
         try:
             await interaction.followup.send(message, ephemeral=True)
@@ -652,6 +676,10 @@ class DuplicateCommands(
         if target_id is None:
             return
         removed = finder.index.exclude(target_id)
+        try:
+            await finder.links.forget(target_id)  # Remove it from its duplicate group.
+        except discord.HTTPException as exc:
+            log.warning("Thread %s: updating related notices failed (%s)", target_id, exc.status)
         log.info(
             "/duplicates forget by user %s: thread %s excluded (data %s)",
             interaction.user.id,
@@ -664,3 +692,167 @@ class DuplicateCommands(
             else f"No data was stored for <#{target_id}>; it will not be indexed in future.",
             ephemeral=True,
         )
+
+    @app_commands.command(
+        name="link", description="Find duplicates of this thread or a thread ID and cross-link them"
+    )
+    @app_commands.describe(thread_id="Optional thread ID; defaults to the thread you are in")
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def link(self, interaction: discord.Interaction, thread_id: str | None = None):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        finder = await self.finder(interaction)
+        if finder is None:
+            return
+        target = await self.resolve_thread(interaction, thread_id, "link")
+        if target is None:
+            return
+        if target.parent_id not in self.bot.config.forum_channel_ids:
+            await interaction.followup.send("That post is not in an enabled forum.", ephemeral=True)
+            return
+        try:
+            async with asyncio.timeout(120):
+                found = await finder.link_post(target)
+        except TimeoutError:
+            await interaction.followup.send("Timed out; try again shortly.", ephemeral=True)
+            return
+        except (EmbeddingError, ClassificationError) as exc:
+            log.warning("Thread %s link check failed (%s)", target.id, exc)
+            await interaction.followup.send(
+                "Could not check this post; try again shortly.", ephemeral=True
+            )
+            return
+        if not found:
+            await interaction.followup.send(
+                "No duplicates confirmed for this post; nothing was posted.", ephemeral=True
+            )
+            return
+        lines = "\n".join(f"• {post_link(target.guild.id, m)}" for m in found)
+        where = (
+            "Posted a related-posts notice in this post only (DUPLICATE_CROSS_LINK=off)."
+            if self.bot.config.duplicate_cross_link == "off"
+            else "Related-posts notices were posted or updated in this post and these posts."
+        )
+        await interaction.followup.send(
+            f"Linked with {len(found)} confirmed duplicate(s):\n{lines}\n{where}", ephemeral=True
+        )
+
+    @app_commands.command(
+        name="link_all",
+        description="Find and cross-link duplicates across every indexed post in a forum",
+    )
+    @app_commands.describe(
+        forum="Enabled forum",
+        mode="preview: only report the groups found; post: cross-link them in Discord",
+    )
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def link_all(
+        self,
+        interaction: discord.Interaction,
+        forum: discord.ForumChannel,
+        mode: Literal["preview", "post"],
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        log.info(
+            "/duplicates link_all by user %s on forum %s (mode %s)",
+            interaction.user.id,
+            forum.id,
+            mode,
+        )
+        finder = await self.finder(interaction)
+        if finder is None or not await self.check_forum(interaction, forum):
+            return
+        if mode == "post" and self.bot.config.duplicate_cross_link == "off":
+            await interaction.followup.send(
+                "Cross-linking is off (DUPLICATE_CROSS_LINK=off); use mode:preview or turn it on.",
+                ephemeral=True,
+            )
+            return
+        if not finder.index.candidates({forum.id}, exclude=0):
+            await interaction.followup.send(
+                "No indexed posts in this forum yet; run `/duplicates index` first.",
+                ephemeral=True,
+            )
+            return
+        cache: dict = {}  # Candidate text, in memory for this run only.
+        titles: dict[int, str] = {}
+        groups: list[list[int]] = []
+
+        async def handle(thread: discord.Thread) -> str:
+            if thread.id not in finder.index:
+                return "skipped"
+            found = await finder.find(thread, cache)
+            if not found:
+                return "unique"
+            titles[thread.id] = thread.name
+            titles.update((m.thread_id, m.title) for m in found)
+            groups.append([thread.id, *(m.thread_id for m in found)])
+            return "grouped"
+
+        async def finish(stopped: bool) -> str:
+            clusters = merge_groups(groups)
+            covered = sum(len(c) for c in clusters)
+            if mode == "preview" or stopped:
+                head = (
+                    "Stopped before posting; nothing was posted or stored."
+                    if stopped and mode == "post"
+                    else "Preview only; nothing was posted or stored."
+                )
+                for cluster in clusters:
+                    log.info("Duplicate group preview in forum %s: %s", forum.id, cluster)
+                shown = "\n".join(
+                    "• "
+                    + " ↔ ".join(
+                        post_link(forum.guild.id, Match(t, titles.get(t, str(t)), 0.0, True))
+                        for t in cluster
+                    )
+                    for cluster in clusters
+                )
+                return f"{head} Found {len(clusters)} group(s) covering {covered} posts:\n{shown}"
+            for group in groups:
+                finder.index.relate(group)
+            failed = 0
+            # Each post's notice is written once, after all groups are known.
+            for thread_id in sorted({t for c in clusters for t in c}, reverse=True):
+                try:
+                    await finder.links.refresh(thread_id)
+                except discord.HTTPException as exc:
+                    failed += 1
+                    log.warning("Thread %s notice update failed (%s)", thread_id, exc.status)
+            note = f" {failed} notice update(s) failed; see the log." if failed else ""
+            return (
+                f"Cross-linked {len(clusters)} group(s) covering {covered} posts; "
+                f"each post's related-posts notice was posted or updated once.{note}"
+            )
+
+        await self.start_full_run(
+            interaction,
+            forum,
+            True,
+            handle,
+            "linking",
+            LINK_STATUSES,
+            self.bot.config.index_concurrency,
+            finish,
+        )
+
+
+def merge_groups(groups: list[list[int]]) -> list[list[int]]:
+    """Connected components of overlapping groups, each newest post first."""
+    parent: dict[int, int] = {}
+
+    def root(node: int) -> int:
+        parent.setdefault(node, node)
+        while parent[node] != node:
+            parent[node] = parent[parent[node]]
+            node = parent[node]
+        return node
+
+    for group in groups:
+        for other in group[1:]:
+            parent[root(other)] = root(group[0])
+    clusters: dict[int, list[int]] = {}
+    for node in list(parent):
+        clusters.setdefault(root(node), []).append(node)
+    return sorted(
+        (sorted(c, reverse=True) for c in clusters.values()), key=lambda c: c[0], reverse=True
+    )
