@@ -19,6 +19,7 @@ def config_env(monkeypatch):
     monkeypatch.delenv("DUPLICATE_THRESHOLD", raising=False)
     monkeypatch.delenv("DUPLICATE_MAX_MATCHES", raising=False)
     monkeypatch.delenv("INDEX_CONCURRENCY", raising=False)
+    monkeypatch.delenv("DUPLICATE_CANDIDATES", raising=False)
 
 
 def test_defaults_and_secrets_are_not_in_repr():
@@ -30,7 +31,8 @@ def test_defaults_and_secrets_are_not_in_repr():
     assert config.command_user_ids == frozenset()
     assert config.tag_concurrency == 4
     assert config.duplicates is False
-    assert config.duplicate_threshold == 0.7
+    assert config.duplicate_threshold == 0.45
+    assert config.duplicate_candidates == 10
     assert config.duplicate_max_matches == 5
     assert config.index_concurrency == 10
     assert config.embedding_model == "openai/text-embedding-3-small"
@@ -57,7 +59,9 @@ def test_defaults_and_secrets_are_not_in_repr():
         ("TAG_CONCURRENCY", "11"),
         ("TAG_CONCURRENCY", "fast"),
         ("DUPLICATES", "maybe"),
-        ("DUPLICATE_THRESHOLD", "0.2"),
+        ("DUPLICATE_THRESHOLD", "0.1"),
+        ("DUPLICATE_CANDIDATES", "0"),
+        ("DUPLICATE_CANDIDATES", "26"),
         ("DUPLICATE_THRESHOLD", "1"),
         ("DUPLICATE_DB_PATH", " "),
         ("DUPLICATE_MAX_MATCHES", "0"),

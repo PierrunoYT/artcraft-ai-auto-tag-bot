@@ -6,9 +6,9 @@ import discord
 import httpx
 from discord import app_commands
 
-from .classifier import ClassificationError, Classifier
+from .classifier import ClassificationError, Classifier, DuplicateJudge
 from .config import Config
-from .duplicates import DuplicateFinder, DuplicateIndex, Embedder, EmbeddingError
+from .duplicates import DuplicateFinder, DuplicateIndex, Embedder, EmbeddingError, post_link
 from .tagging import Tagger
 
 log = logging.getLogger(__name__)
@@ -48,6 +48,7 @@ class ArtCraftBot(discord.Client):
                 ),
                 config,
                 asyncio.Semaphore(config.index_concurrency),
+                DuplicateJudge(self.http_client, config.openrouter_api_key, config.model),
             )
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(TagCommands(self))
@@ -95,7 +96,8 @@ class ArtCraftBot(discord.Client):
     async def check_new_post_duplicates(self, thread: discord.Thread) -> None:
         try:
             await self.duplicates.check_new_post(thread)
-        except (EmbeddingError, discord.HTTPException) as exc:
+        except (EmbeddingError, ClassificationError, discord.HTTPException) as exc:
+            # A failed AI check never produces a reply; the post is still indexed.
             log.warning("Thread %s duplicate check failed (%s)", thread.id, type(exc).__name__)
 
     def forget_deleted(self, thread_id: int) -> None:
@@ -604,8 +606,8 @@ class DuplicateCommands(
         if target is None:
             return
         try:
-            found = await finder.similar_to(target, limit)
-        except EmbeddingError as exc:
+            found = await finder.review(target, limit)
+        except (EmbeddingError, ClassificationError) as exc:
             log.warning("Thread %s similarity lookup failed (%s)", target.id, exc)
             await interaction.followup.send(
                 "Could not compute similarity; try again shortly.", ephemeral=True
@@ -616,15 +618,25 @@ class DuplicateCommands(
                 "No other indexed posts in this forum yet.", ephemeral=True
             )
             return
-        threshold = self.bot.config.duplicate_threshold
-        lines = "\n".join(
-            f"• <#{t}> {score:.0%}{' ✅' if score >= threshold else ''}" for t, score in found
+        floor = self.bot.config.duplicate_threshold
+        header = (
+            "Most similar posts by embedding score. ✅ = confirmed as a duplicate by the AI "
+            "check; a new post like this would get a reply linking those "
+            f"(only candidates scoring at least {floor:.0%} are checked)."
         )
-        await interaction.followup.send(
-            f"Most similar indexed posts (✅ = at or above the {threshold:.0%} reply "
-            f"threshold):\n{lines}",
-            ephemeral=True,
-        )
+        lines = []
+        length = len(header)
+        for match in sorted(found, key=lambda m: m.score, reverse=True):
+            line = (
+                f"\n• {post_link(target.guild.id, match)} {match.score:.0%}"
+                f"{' ✅' if match.confirmed else ''}"
+                f"{' (below floor)' if match.score < floor else ''}"
+            )
+            if length + len(line) > 1990:  # Discord's 2,000-character message limit.
+                break
+            lines.append(line)
+            length += len(line)
+        await interaction.followup.send(header + "".join(lines), ephemeral=True)
 
     @app_commands.command(
         name="forget", description="Delete a post's duplicate-detection data and never index it"

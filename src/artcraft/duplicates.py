@@ -11,12 +11,14 @@ import operator
 import sqlite3
 from array import array
 from collections.abc import Sequence
+from dataclasses import dataclass
 
 import discord
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
 from . import posts
+from .classifier import DuplicateJudge
 from .config import Config
 
 log = logging.getLogger(__name__)
@@ -174,6 +176,21 @@ class DuplicateIndex:
         self.db.close()
 
 
+@dataclass(frozen=True)
+class Match:
+    thread_id: int
+    title: str
+    score: float  # Embedding similarity, used to shortlist candidates.
+    confirmed: bool  # Whether the AI check judged it a real duplicate.
+
+
+def post_link(guild_id: int, match: Match) -> str:
+    """A masked link showing the post's live title (channel mentions of archived posts
+    render as "unknown" in clients that have not loaded them)."""
+    title = discord.utils.escape_markdown(match.title[:80]).replace("[", "(").replace("]", ")")
+    return f"[{title}](https://discord.com/channels/{guild_id}/{match.thread_id})"
+
+
 class DuplicateFinder:
     def __init__(
         self,
@@ -182,6 +199,7 @@ class DuplicateFinder:
         index: DuplicateIndex,
         config: Config,
         slots: asyncio.Semaphore,
+        judge: DuplicateJudge,
     ):
         self.client = client
         self.embedder = embedder
@@ -189,23 +207,35 @@ class DuplicateFinder:
         self.config = config
         # Caps concurrent embedding requests (INDEX_CONCURRENCY), separately from tagging.
         self.slots = slots
+        self.judge = judge
+
+    async def _read_post(
+        self, thread: discord.Thread, retry_delays: Sequence[float] = ()
+    ) -> tuple[str, str] | None:
+        """(title, body) of a post; body is empty when only the title is usable."""
+        title = thread.name[:256]
+        text = await posts.starter_text(thread, retry_delays)
+        if text is not None:
+            return title, text[:6000]
+        # The starter was deleted; the title is still public on Discord.
+        if not posts.title_is_usable(title):
+            log.info("Thread %s: no starter and the title is too short to use", thread.id)
+            return None
+        log.info("Thread %s: starter deleted; using the title only", thread.id)
+        return title, ""
+
+    async def _embed(self, title: str, body: str) -> array:
+        async with self.slots:
+            return await self.embedder.embed(f"{title}\n\n{body}" if body else title)
 
     async def _embed_post(
         self, thread: discord.Thread, retry_delays: Sequence[float] = ()
-    ) -> array | None:
-        title = thread.name[:256]
-        text = await posts.starter_text(thread, retry_delays)
-        if text is None:
-            # The starter was deleted; the title is still public on Discord.
-            if not posts.title_is_usable(title):
-                log.info("Thread %s not indexed: no starter and the title is too short", thread.id)
-                return None
-            log.info("Thread %s indexed from the title only (starter deleted)", thread.id)
-            content = title
-        else:
-            content = f"{title}\n\n{text[:6000]}"
-        async with self.slots:
-            return await self.embedder.embed(content)
+    ) -> tuple[array, str, str] | None:
+        """(vector, title, body) for a post, or None if nothing usable remains."""
+        post = await self._read_post(thread, retry_delays)
+        if post is None:
+            return None
+        return await self._embed(*post), *post
 
     async def index_post(self, thread: discord.Thread, refresh: bool = False) -> str:
         """Embed and store a post; returns "indexed", "unchanged" (already indexed),
@@ -216,62 +246,104 @@ class DuplicateFinder:
             return "skipped"
         if thread.id in self.index and not refresh:
             return "unchanged"
-        vector = await self._embed_post(thread)
-        if vector is None:
+        embedded = await self._embed_post(thread)
+        if embedded is None:
             # Never keep a vector derived from content that is gone.
             self.index.remove(thread.id)
             return "skipped"
-        if not self.index.add(thread.id, thread.parent_id, vector):
+        if not self.index.add(thread.id, thread.parent_id, embedded[0]):
             return "skipped"
         return "indexed"
 
-    async def matches(
-        self, forum_id: int, thread_id: int, vector: array, threshold: float, limit: int
+    async def shortlist(
+        self, forum_id: int, thread_id: int, vector: array, floor: float, limit: int
     ) -> list[tuple[int, float]]:
         candidates = self.index.candidates(forum_id, exclude=thread_id)
-        return await asyncio.to_thread(rank, candidates, vector, threshold, limit)
+        return await asyncio.to_thread(rank, candidates, vector, floor, limit)
 
-    async def check_new_post(self, thread: discord.Thread) -> list[tuple[int, float]]:
-        """Reply with links to similar posts, then add the new post to the index."""
+    async def _load(self, thread_id: int) -> tuple[str, str] | None:
+        """A candidate's live (title, body) from Discord; un-indexes posts that no
+        longer exist. Nothing read here is stored."""
+        try:
+            thread = await self.client.fetch_channel(thread_id)
+        except discord.NotFound:
+            thread = None
+        except discord.HTTPException:
+            return None  # E.g. no access right now; keep the entry.
+        if not isinstance(thread, discord.Thread):
+            self.index.remove(thread_id)
+            log.info("Thread %s removed from the duplicate index (no longer exists)", thread_id)
+            return None
+        text = await posts.starter_text(thread)
+        return thread.name[:256], (text or "")[:1000]
+
+    async def confirm(
+        self, title: str, body: str, shortlist: list[tuple[int, float]]
+    ) -> list[Match]:
+        """Shortlisted posts that still exist, AI-confirmed duplicates first (in the
+        model's order), then the rest by similarity."""
+        loaded = await asyncio.gather(*(self._load(t) for t, _ in shortlist))
+        live = {t: post for (t, _), post in zip(shortlist, loaded, strict=True) if post}
+        if not live:
+            return []
+        chosen = await self.judge.confirm(title, body, {str(t): p for t, p in live.items()})
+        order = {int(t): i for i, t in enumerate(chosen)}
+        matches = [Match(t, live[t][0], score, t in order) for t, score in shortlist if t in live]
+        return sorted(matches, key=lambda m: (not m.confirmed, order.get(m.thread_id, 0)))
+
+    async def check_new_post(self, thread: discord.Thread) -> list[Match]:
+        """Reply with links to AI-confirmed duplicates, then add the post to the index."""
         if thread.parent_id not in self.config.forum_channel_ids:
             return []
         if thread.id in self.index.excluded:
             return []
-        vector = await self._embed_post(thread, posts.NEW_POST_RETRY_DELAYS)
-        if vector is None:
+        embedded = await self._embed_post(thread, posts.NEW_POST_RETRY_DELAYS)
+        if embedded is None:
             return []
-        found = await self.matches(
+        vector, title, body = embedded
+        shortlist = await self.shortlist(
             thread.parent_id,
             thread.id,
             vector,
             self.config.duplicate_threshold,
-            self.config.duplicate_max_matches,
+            self.config.duplicate_candidates,
         )
         self.index.add(thread.id, thread.parent_id, vector)
-        if not found:
+        if not shortlist:
             log.info("Thread %s: no similar posts", thread.id)
             return []
+        found = [m for m in await self.confirm(title, body, shortlist) if m.confirmed]
+        found = found[: self.config.duplicate_max_matches]
+        if not found:
+            log.info("Thread %s: %d candidates, none confirmed", thread.id, len(shortlist))
+            return []
         log.info(
-            "Thread %s may duplicate: %s",
+            "Thread %s duplicates (AI-confirmed): %s",
             thread.id,
-            ", ".join(f"{t} ({score:.2f})" for t, score in found),
+            ", ".join(f"{m.thread_id} ({m.score:.2f})" for m in found),
         )
         await self._reply(thread, found)
         return found
 
-    async def similar_to(self, thread: discord.Thread, limit: int = 10) -> list[tuple[int, float]]:
-        """Closest posts regardless of threshold, for moderators tuning detection."""
-        vector = self.index.get(thread.id) or await self._embed_post(thread)
-        if vector is None:
+    async def review(self, thread: discord.Thread, limit: int = 10) -> list[Match]:
+        """The closest posts regardless of the floor, with the AI verdict a new post
+        would get, for moderators checking detection quality."""
+        post = await self._read_post(thread)
+        if post is None:
             return []
-        return await self.matches(thread.parent_id, thread.id, vector, -1.0, limit)
+        # Reuse the stored vector when the post is indexed; embed only if it is not.
+        vector = self.index.get(thread.id) or await self._embed(*post)
+        shortlist = await self.shortlist(thread.parent_id, thread.id, vector, -1.0, limit)
+        if not shortlist:
+            return []
+        return await self.confirm(*post, shortlist)
 
-    async def _reply(self, thread: discord.Thread, found: list[tuple[int, float]]) -> None:
+    async def _reply(self, thread: discord.Thread, found: list[Match]) -> None:
         forum = self.client.get_channel(thread.parent_id)
         if forum is None or not forum.permissions_for(thread.guild.me).send_messages_in_threads:
             log.warning("Thread %s: missing Send Messages in Threads; no reply sent", thread.id)
             return
-        lines = "\n".join(f"• <#{t}> ({score:.0%} similar)" for t, score in found)
+        lines = "\n".join(f"• {post_link(thread.guild.id, m)}" for m in found)
         await thread.send(
             f"🔁 Possibly related posts:\n{lines}\n\n"
             "If one of these covers your post, consider adding to it there.",

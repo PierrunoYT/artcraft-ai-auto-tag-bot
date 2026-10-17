@@ -33,7 +33,11 @@ message text and tag names may themselves contain personal information.
 If the operator enables duplicate detection, the same title and starter text are
 also sent to OpenRouter to compute an embedding (a list of numbers representing the
 post's meaning). The purpose is to point authors of new posts to similar earlier
-posts. Embeddings are compared only with posts in the same forum.
+posts. Embeddings are compared only with posts in the same forum. To confirm
+matches, the titles and up to 1,000 characters of the starter messages of up to 25
+similar earlier posts in the same forum are read from Discord when a new post
+arrives and sent to OpenRouter, with the same zero-data-retention routing, together
+with the new post. This text is used only for that check and is not stored.
 
 If a post's starter message has been deleted, only the title is used. The bot does
 not intentionally include replies, attachment contents, embeds, or linked-page

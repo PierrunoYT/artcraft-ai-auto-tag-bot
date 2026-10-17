@@ -1,3 +1,4 @@
+import json
 import logging
 import sqlite3
 from copy import deepcopy
@@ -49,8 +50,17 @@ async def test_new_post_gets_a_reply_linking_similar_posts_and_is_indexed(world,
 
     [(channel_id, payload)] = world.sent
     assert channel_id == 200
-    assert "<#201> (95% similar)" in payload["content"]
-    assert "<#202>" not in payload["content"]
+    assert "[Export loses gradients](https://discord.com/channels/10/201)" in payload["content"]
+    assert (
+        "https://discord.com/channels/10/202" not in payload["content"]
+    )  # Below the shortlist floor.
+    # The AI check saw the new post and the live text of the shortlisted candidate only.
+    [judge] = world.judge_requests
+    data = json.loads(judge["messages"][1]["content"])
+    assert data["new_post"]["title"] == "My digital painting"
+    assert [c["id"] for c in data["candidates"]] == ["201"]
+    assert data["candidates"][0]["body"] == "A digital landscape, feedback welcome."
+    assert judge["provider"]["zdr"] is True
     assert payload["allowed_mentions"]["parse"] == []
     assert 200 in duplicates.index
     request = world.embeddings[-1]
@@ -72,7 +82,7 @@ async def test_reply_lists_up_to_the_configured_number_of_matches(world, duplica
     [(_, payload)] = world.sent
     links = [line for line in payload["content"].splitlines() if line.startswith("•")]
     assert duplicates.config.duplicate_max_matches == 5
-    assert [line.split()[1] for line in links] == [f"<#{t}>" for t in range(201, 206)]
+    assert [line.split("/")[-1].rstrip(")") for line in links] == [str(t) for t in range(201, 206)]
 
 
 async def test_tagging_failure_does_not_block_the_duplicate_check(world, duplicates):
@@ -270,7 +280,7 @@ async def test_forget_deletes_data_and_prevents_reindexing(world, duplicates, in
     assert 200 not in duplicates.index
 
 
-async def test_similar_command_marks_matches_above_the_threshold(world, duplicates, interaction):
+async def test_similar_command_shows_titles_scores_and_ai_verdicts(world, duplicates, interaction):
     add_thread(world, 201, "Export loses gradients")
     add_thread(world, 202, "Unrelated question")
     world.vectors = {
@@ -280,11 +290,12 @@ async def test_similar_command_marks_matches_above_the_threshold(world, duplicat
     }
     for thread_id in (200, 201, 202):
         await index(world, duplicates, thread_id)
+    world.judge = ["201"]  # The AI check confirms only the real duplicate.
     group = world.bot.tree.get_command("duplicates")
     await group.similar.callback(group, interaction)
     message = interaction.followup.send.call_args.args[0]
-    assert "<#201> 95% ✅" in message
-    assert "<#202> 0%" in message and "<#202> 0% ✅" not in message
+    assert "[Export loses gradients](https://discord.com/channels/10/201) 95% ✅" in message
+    assert "[Unrelated question](https://discord.com/channels/10/202) 0% (below floor)" in message
 
 
 async def test_unconfigured_forums_are_purged(world, duplicates):
@@ -323,3 +334,70 @@ async def test_new_post_waits_for_a_lagging_starter(world, duplicates, no_retry_
     world.lagging_starters[200] = 2  # Readable on the third attempt.
     await duplicates.check_new_post(await world.bot.fetch_channel(200))
     assert world.embeddings[-1]["input"].startswith("My digital painting\n\nA digital")
+
+
+async def similar_pair(world, duplicates):
+    add_thread(world, 201, "Export loses gradients")
+    world.vectors = {"Export loses gradients": [1.0, 0.0, 0.0], "My digital painting": SIMILAR}
+    await index(world, duplicates, 201)
+
+
+async def test_no_reply_when_the_ai_check_rejects_every_candidate(world, duplicates):
+    await similar_pair(world, duplicates)
+    world.judge = []
+    await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+    assert len(world.judge_requests) == 1
+    assert world.sent == []
+    assert 200 in duplicates.index
+
+
+async def test_failed_ai_check_sends_no_reply_but_indexes_the_post(world, duplicates, caplog):
+    await similar_pair(world, duplicates)
+    world.judge_status = 503
+    with caplog.at_level(logging.WARNING):
+        await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+    assert world.sent == []
+    assert 200 in duplicates.index
+    assert "duplicate check failed (ClassificationError)" in caplog.text
+    assert "digital landscape" not in caplog.text
+
+
+async def test_candidates_deleted_on_discord_are_dropped_and_unindexed(world, duplicates):
+    await similar_pair(world, duplicates)
+    del world.channels[201]  # Deleted while the bot was offline.
+    await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+    assert world.judge_requests == []  # Nothing left to check.
+    assert world.sent == []
+    assert 201 not in duplicates.index
+
+
+async def test_candidate_with_a_deleted_starter_is_checked_by_title(world, duplicates):
+    await similar_pair(world, duplicates)
+    world.deleted_starters.add(201)
+    await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+    data = json.loads(world.judge_requests[0]["messages"][1]["content"])
+    assert data["candidates"] == [{"id": "201", "title": "Export loses gradients", "body": ""}]
+    assert len(world.sent) == 1
+
+
+async def test_reply_follows_the_ai_order(world, duplicates):
+    for offset, title in enumerate(["Gradient bug one", "Gradient bug two"]):
+        add_thread(world, 201 + offset, title)
+        world.vectors[title] = [1.0, 0.05 * offset, 0.0]
+        await index(world, duplicates, 201 + offset)
+    world.vectors["My digital painting"] = [1.0, 0.0, 0.0]
+    world.judge = ["202", "201"]  # The AI ranks the less similar post first.
+    await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+    content = world.sent[0][1]["content"]
+    assert content.index("Gradient bug two") < content.index("Gradient bug one")
+
+
+async def test_similar_command_stays_within_discords_message_limit(world, duplicates, interaction):
+    for offset in range(25):
+        title = f"A very long and descriptive feature request title number {offset} " * 2
+        add_thread(world, 201 + offset, title)
+        world.vectors[title.split("\n\n")[0]] = [1.0, 0.01 * offset, 0.0]
+        await index(world, duplicates, 201 + offset)
+    group = world.bot.tree.get_command("duplicates")
+    await group.similar.callback(group, interaction, None, 25)
+    assert len(interaction.followup.send.call_args.args[0]) <= 2000

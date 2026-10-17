@@ -28,10 +28,13 @@ class Config:
     duplicate_db_key: str = field(default="", repr=False)
     duplicate_db_path: str = "duplicates.db"
     embedding_model: str = DEFAULT_EMBEDDING_MODEL
-    # Calibrated on text-embedding-3-small: rephrased duplicates scored ~0.77-0.78,
-    # related but different requests at most ~0.52.
-    duplicate_threshold: float = 0.7
-    # Most similar posts linked in a reply.
+    # Minimum embedding similarity to shortlist a candidate for the AI check. Real
+    # duplicates scored only 0.50-0.59 with text-embedding-3-small, close to related
+    # posts, so the floor is low and the AI check makes the final call.
+    duplicate_threshold: float = 0.45
+    # Candidates shortlisted by embedding similarity and sent to the AI check.
+    duplicate_candidates: int = 10
+    # Most AI-confirmed duplicates linked in a reply.
     duplicate_max_matches: int = 5
     # Posts indexed at the same time; embeddings are cheap and fast, so this is
     # separate from (and higher than) TAG_CONCURRENCY.
@@ -98,11 +101,17 @@ class Config:
         if not embedding_model:
             raise ValueError("EMBEDDING_MODEL must be nonempty")
         try:
-            threshold = float(os.getenv("DUPLICATE_THRESHOLD", "0.7"))
-            if not 0.5 <= threshold <= 0.99:
+            threshold = float(os.getenv("DUPLICATE_THRESHOLD", "0.45"))
+            if not 0.2 <= threshold <= 0.95:
                 raise ValueError
         except ValueError:
-            raise ValueError("DUPLICATE_THRESHOLD must be a number from 0.5 to 0.99") from None
+            raise ValueError("DUPLICATE_THRESHOLD must be a number from 0.2 to 0.95") from None
+        try:
+            candidates = int(os.getenv("DUPLICATE_CANDIDATES", "10"))
+            if not 1 <= candidates <= 25:
+                raise ValueError
+        except ValueError:
+            raise ValueError("DUPLICATE_CANDIDATES must be an integer from 1 to 25") from None
         try:
             max_matches = int(os.getenv("DUPLICATE_MAX_MATCHES", "5"))
             if not 1 <= max_matches <= 10:
@@ -130,6 +139,7 @@ class Config:
             duplicate_db_path=db_path,
             embedding_model=embedding_model,
             duplicate_threshold=threshold,
+            duplicate_candidates=candidates,
             duplicate_max_matches=max_matches,
             index_concurrency=index_concurrency,
         )

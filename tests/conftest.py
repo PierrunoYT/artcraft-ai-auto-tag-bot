@@ -12,6 +12,7 @@ from cryptography.fernet import Fernet
 
 from artcraft import posts
 from artcraft.bot import ArtCraftBot
+from artcraft.classifier import DuplicateJudge
 from artcraft.config import Config
 from artcraft.duplicates import DuplicateFinder, DuplicateIndex, Embedder
 
@@ -110,6 +111,9 @@ async def world(monkeypatch):
         embedding_status=200,
         embed_in_flight=0,
         max_embed_in_flight=0,
+        judge_requests=[],  # AI duplicate-check request payloads.
+        judge=None,  # IDs the AI check confirms; None confirms every candidate.
+        judge_status=200,
         vectors={},  # Post title -> embedding returned by the fake model.
         sent=[],  # (channel_id, payload) for messages the bot sends.
         deleted_starters=set(),
@@ -117,6 +121,8 @@ async def world(monkeypatch):
     )
 
     async def get_channel(channel_id):
+        if channel_id not in world.channels:  # Deleted on Discord.
+            raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "")
         return deepcopy(world.channels[channel_id])
 
     async def edit_channel(channel_id, **fields):
@@ -202,6 +208,24 @@ async def world(monkeypatch):
             return httpx.Response(
                 world.embedding_status, json={"data": [{"embedding": vector, "index": 0}]}
             )
+        if payload["response_format"]["json_schema"]["name"] == "duplicate_posts":
+            world.judge_requests.append(payload)
+            allowed = payload["response_format"]["json_schema"]["schema"]["properties"][
+                "duplicate_ids"
+            ]["items"]["enum"]
+            # By default the AI check confirms every candidate it is shown.
+            chosen = allowed if world.judge is None else world.judge
+            return httpx.Response(
+                world.judge_status,
+                json={
+                    "choices": [
+                        {
+                            "finish_reason": "stop",
+                            "message": {"content": json.dumps({"duplicate_ids": chosen})},
+                        }
+                    ]
+                },
+            )
         world.requests.append(payload)
         world.in_flight += 1
         world.max_in_flight = max(world.max_in_flight, world.in_flight)
@@ -251,6 +275,7 @@ def duplicates(world, tmp_path):
         DuplicateIndex(config.duplicate_db_path, DB_KEY, config.embedding_model),
         config,
         asyncio.Semaphore(config.index_concurrency),
+        DuplicateJudge(world.bot.http_client, "fake-key", config.model),
     )
     return world.bot.duplicates
 

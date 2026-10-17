@@ -78,8 +78,9 @@ and use URLs for your own deployment. See also the official
 | `DUPLICATES` | No | `off` (default) or `on`; enables duplicate detection |
 | `DUPLICATE_DB_KEY` | If `DUPLICATES=on` | Fernet key encrypting stored embeddings; keep it secret and backed up |
 | `DUPLICATE_DB_PATH` | No | `duplicates.db`; SQLite file for the encrypted index |
-| `DUPLICATE_THRESHOLD` | No | `0.7`, from 0.5 to 0.99; minimum similarity for a reply |
-| `DUPLICATE_MAX_MATCHES` | No | `5`, from 1 to 10; most similar posts linked in a reply |
+| `DUPLICATE_THRESHOLD` | No | `0.45`, from 0.2 to 0.95; minimum embedding similarity to shortlist a candidate for the AI check |
+| `DUPLICATE_CANDIDATES` | No | `10`, from 1 to 25; candidates shortlisted per new post |
+| `DUPLICATE_MAX_MATCHES` | No | `5`, from 1 to 10; most AI-confirmed duplicates linked in a reply |
 | `INDEX_CONCURRENCY` | No | `10`, from 1 to 20; posts indexed at the same time |
 | `EMBEDDING_MODEL` | No | `openai/text-embedding-3-small`; must have a ZDR endpoint |
 
@@ -136,8 +137,9 @@ These reply "Duplicate detection is off" unless `DUPLICATES=on`.
   are skipped, so re-running only embeds new posts. Never replies in posts.
 - **`/duplicates stop forum:<forum>`** — stop a running `/duplicates index`.
 - **`/duplicates similar [thread_id] [limit:10]`** — list up to 25 of the most
-  similar indexed posts with scores, marking those at or above the reply threshold.
-  Useful for tuning `DUPLICATE_THRESHOLD`.
+  similar indexed posts with their live titles and scores, running the same AI
+  check a new post gets and marking confirmed duplicates with ✅. Posts below the
+  shortlist floor are labeled. Useful for checking detection quality.
 - **`/duplicates forget thread_id:<id>`** — delete a post's stored duplicate data and
   never index it again, for example on a member's deletion request.
 
@@ -202,12 +204,22 @@ DUPLICATE_DB_KEY=<the generated key>
 Back up the key: without it the index cannot be read, and a new key means rebuilding
 the index. Update your Privacy Policy and tell members before enabling it.
 
-- **New posts:** the title and up to 6,000 characters of the starter message are
-  turned into an embedding (via OpenRouter, with the same ZDR routing) and compared
-  with other posts in the same forum. If any score at least `DUPLICATE_THRESHOLD`,
-  the bot replies in the post with links to the most similar ones (up to
-  `DUPLICATE_MAX_MATCHES`, default 5), then adds the post to the index. Mentions are
-  disabled in the reply.
+- **New posts:** detection works in two steps.
+  1. **Shortlist:** the title and up to 6,000 characters of the starter message are
+     turned into an embedding (via OpenRouter, with the same ZDR routing) and
+     compared with other posts in the same forum. Up to `DUPLICATE_CANDIDATES`
+     posts scoring at least `DUPLICATE_THRESHOLD` are shortlisted.
+  2. **AI check:** the bot reads each candidate's title and up to 1,000 characters
+     of its starter live from Discord (nothing extra is stored) and asks
+     `OPENROUTER_MODEL`, with the same ZDR routing and strict structured output,
+     which candidates ask for or report the same thing. Related but different
+     requests are rejected.
+
+  The bot replies in the post with titled links to the confirmed duplicates (up to
+  `DUPLICATE_MAX_MATCHES`), then adds the post to the index. Mentions are disabled.
+  If the AI check fails, no reply is sent. Candidates whose post no longer exists
+  are dropped and removed from the index. This costs one AI call per new post with
+  candidates, about $0.0005.
 - **Existing posts:** run `/duplicates index` once per forum to build the index.
 - **Stored data:** per post, only the post ID, forum ID, embedding model name, and
   the embedding vector, encrypted with `DUPLICATE_DB_KEY`. No titles, text,
@@ -221,9 +233,11 @@ the index. Update your Privacy Policy and tell members before enabling it.
   in `FORUM_CHANNEL_IDS` and vectors from a different `EMBEDDING_MODEL` are deleted.
   `/duplicates forget` handles deletion requests. Title edits are picked up only when a
   post is re-indexed. Deletions that happen while the bot is offline are not seen.
-- **Threshold:** calibrated on rephrased requests, where duplicates scored about
-  0.77 and related but different requests at most about 0.52. Use `/duplicates similar`
-  on real posts and adjust if replies are too frequent or too rare.
+- **Why the AI check:** on real posts, embedding scores could not separate
+  duplicates from related requests. Email-client requests scored 50–59% with each
+  other while unrelated app ideas scored 48–52%. The low floor only removes clearly
+  unrelated posts; the AI check makes the final call. Use `/duplicates similar` on
+  real posts to review its verdicts.
 
 Enabling it also turns on the non-privileged Guild Messages intent so the bot sees
 starter edits and deletions; message content is never cached or logged.
