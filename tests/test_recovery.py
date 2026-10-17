@@ -173,7 +173,13 @@ async def test_history_lists_runs_and_thread_actions(world, interaction):
 
 async def test_history_commands_are_moderator_only(world, interaction):
     group = world.bot.tree.get_command("history")
-    assert {c.name for c in group.commands} == {"runs", "thread", "undo", "undo_recent"}
+    assert {c.name for c in group.commands} == {
+        "runs",
+        "thread",
+        "undo",
+        "undo_recent",
+        "undo_thread",
+    }
     interaction.user = world.guild.get_member(3)
     assert not await group.interaction_check(interaction)
     for command in group.commands:
@@ -196,3 +202,90 @@ def test_invalid_recovery_settings_fail(monkeypatch, name, value):
         monkeypatch.setenv(key, setting)
     with pytest.raises(ValueError, match=name):
         Config.from_env()
+
+
+async def linked_group(world, duplicates, **metadata):
+    """New post 200 is tagged and cross-linked with older posts 201 and 202."""
+    world.channels[200]["name"] = "Please make an email app"
+    add_thread(world, 201, "Apple Mail replacement", **metadata)
+    add_thread(world, 202, "EmailCraft")
+    world.vectors = {
+        "Apple Mail replacement": [1.0, 0.0, 0.0],
+        "EmailCraft": [0.98, 0.2, 0.0],
+        "Please make an email app": SIMILAR,
+    }
+    for thread_id in (201, 202):
+        await duplicates.index_post(await world.bot.fetch_channel(thread_id))
+    await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+    assert {channel for channel, _ in world.sent} == {200, 201, 202}
+
+
+def bot_messages_in(world, thread_id):
+    return [m for m, c in world.message_channels.items() if c == thread_id and m in world.messages]
+
+
+async def undo_thread(world, interaction, thread_id=None, confirm=True):
+    group = world.bot.tree.get_command("history")
+    await group.undo_thread.callback(
+        group, interaction, None if thread_id is None else str(thread_id), confirm
+    )
+    await asyncio.gather(*group.undo_tasks)
+    return message(interaction)
+
+
+async def test_undo_thread_previews_without_changing_anything(world, duplicates, interaction):
+    await linked_group(world, duplicates)
+    text = await undo_thread(world, interaction, confirm=False)
+    assert "Preview for <#200>" in text
+    assert "unlink it from 2 related post(s)" in text
+    assert "in 3 post(s)" in text
+    assert world.removed_messages == []
+    assert world.channels[200]["applied_tags"] == ["14", "11", "12"]
+
+
+async def test_undo_thread_removes_the_whole_group_the_way_it_was_posted(
+    world, duplicates, interaction
+):
+    await linked_group(world, duplicates)
+    text = await undo_thread(world, interaction)  # Run inside post 200.
+    for thread_id in (200, 201, 202):
+        assert bot_messages_in(world, thread_id) == []
+        assert duplicates.index.related(thread_id) == []
+        assert duplicates.index.notice(thread_id) is None
+    assert len(world.removed_messages) == 3  # One notice per post; starters untouched.
+    assert world.channels[200]["applied_tags"] == ["14"]  # Tags restored too.
+    assert "deleted 3 bot message(s) across 3 post(s)" in text
+    assert "1 tag change(s) restored" in text
+
+
+async def test_undo_thread_works_from_any_post_in_the_group(world, duplicates, interaction):
+    await linked_group(world, duplicates)
+    await undo_thread(world, interaction, thread_id=202)
+    assert all(bot_messages_in(world, t) == [] for t in (200, 201, 202))
+    assert duplicates.index.related(200) == []
+
+
+async def test_undo_thread_reopens_archived_posts_briefly(world, duplicates, interaction):
+    await linked_group(world, duplicates, archived=True)
+    await undo_thread(world, interaction)
+    assert bot_messages_in(world, 201) == []
+    assert world.channels[201]["thread_metadata"]["archived"] is True
+
+
+async def test_member_linked_elsewhere_keeps_an_updated_notice(world, duplicates, interaction):
+    await linked_group(world, duplicates)
+    duplicates.index.relate([201, 205])  # 201 is also in an unrelated group.
+    add_thread(world, 205, "Mail merge in GridCraft")
+    await undo_thread(world, interaction)
+    remaining = world.messages[duplicates.index.notice(201)]
+    assert "Mail merge in GridCraft" in remaining
+    assert "Please make an email app" not in remaining
+    assert bot_messages_in(world, 200) == bot_messages_in(world, 202) == []
+
+
+async def test_undo_thread_deletes_unjournaled_bot_posts_without_duplicates(world, interaction):
+    world.messages[777] = "🔁 Possibly related posts: (from an older bot version)"
+    world.message_channels[777] = 200
+    text = await undo_thread(world, interaction)
+    assert world.removed_messages == [(200, 777)]
+    assert "deleted 1 bot message(s) across 1 post(s)" in text

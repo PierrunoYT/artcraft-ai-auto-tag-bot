@@ -297,6 +297,14 @@ titles or message text) so it can recover from restarts and undo its own changes
   - **`/history undo run:<id> [confirm:True]`** — undo one run's changes.
   - **`/history undo_recent minutes:<n> [confirm:True]`** — undo every bot change
     from the last *n* minutes (up to 24 hours), including new-post tagging.
+  - **`/history undo_thread [thread_id] [confirm:True]`** — run inside any post to
+    undo everything the bot did there: restore its recorded tag changes, remove its
+    duplicate group links, and delete the bot's messages in this post **and every
+    post it was cross-linked with**, the same way they were posted (one per post).
+    Messages are found by scanning each post, so older, unrecorded bot posts are
+    removed too; members' messages are never touched. Archived posts are reopened
+    briefly and archived again; locked posts are left alone. A linked post that is
+    also part of another group keeps its notice, updated to drop this group.
 
   Without `confirm:True`, undo only shows what it would revert. Tags are restored
   only where they still match what the bot left, so later manual edits are never

@@ -1083,6 +1083,49 @@ class HistoryCommands(
         actions = self.bot.journal.actions(since=since)
         await self.undo_actions(interaction, actions, f"the last {minutes} minute(s)", confirm)
 
+    @app_commands.command(
+        name="undo_thread",
+        description="Undo everything the bot did in this post and its linked posts",
+    )
+    @app_commands.describe(
+        thread_id="Optional thread ID; defaults to the thread you are in",
+        confirm="Set to True to actually undo",
+    )
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def undo_thread(
+        self, interaction: discord.Interaction, thread_id: str | None = None, confirm: bool = False
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target = await self.resolve_thread(interaction, thread_id, "undo_thread")
+        if target is None:
+            return
+        tags, links, group = self.bot.recovery.thread_plan(target.id)
+        others = len(group) - 1
+        if not confirm:
+            await interaction.followup.send(
+                f"Preview for <#{target.id}>: would restore {len(tags)} recorded tag "
+                f"change(s) (only where tags are unchanged since), unlink it from "
+                f"{others} related post(s), and delete the bot's messages in "
+                f"{len(group)} post(s) (this one and its linked posts), reopening "
+                "archived posts briefly. Run again with `confirm:True` to undo.",
+                ephemeral=True,
+            )
+            return
+        log.info("/history undo_thread by user %s on thread %s", interaction.user.id, target.id)
+        await interaction.followup.send(
+            f"Undoing the bot's changes for <#{target.id}> and {others} linked post(s); "
+            "I'll report when done.",
+            ephemeral=True,
+        )
+
+        async def run_undo() -> None:
+            result = await self.bot.recovery.undo_thread(target.id, interaction.user.id)
+            await self.report(interaction, f"Undo for <#{target.id}> finished: {result}")
+
+        task = asyncio.create_task(run_undo())
+        self.undo_tasks.add(task)
+        task.add_done_callback(self.undo_tasks.discard)
+
     async def undo_actions(
         self, interaction: discord.Interaction, actions: list[Action], label: str, confirm: bool
     ) -> None:

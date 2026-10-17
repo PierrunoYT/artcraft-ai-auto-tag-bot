@@ -123,6 +123,7 @@ async def world(monkeypatch, tmp_path):
         vectors={},  # Post title -> embedding returned by the fake model.
         sent=[],  # (channel_id, payload) for messages the bot sends.
         messages={},  # Message ID -> current content of the bot's live messages.
+        message_channels={},  # Message ID -> thread it was posted in.
         edited=[],  # (channel_id, message_id, payload) for message edits.
         removed_messages=[],  # (channel_id, message_id) for deleted messages.
         deleted_starters=set(),
@@ -205,6 +206,7 @@ async def world(monkeypatch, tmp_path):
         world.sent.append((channel_id, params.payload))
         message_id = 900 + len(world.sent)
         world.messages[message_id] = params.payload["content"]
+        world.message_channels[message_id] = channel_id
         return bot_message(message_id, channel_id, params.payload["content"])
 
     async def edit_message(channel_id, message_id, *, params):
@@ -220,9 +222,21 @@ async def world(monkeypatch, tmp_path):
         world.messages.pop(message_id, None)
         world.removed_messages.append((channel_id, message_id))
 
+    async def logs_from(channel_id, limit, before=None, after=None, around=None):
+        # A thread's history: the author's starter plus the bot's live messages.
+        starter = bot_message(channel_id, channel_id, "Starter text")
+        starter["author"] = {"id": "2", "username": "artist", "discriminator": "0", "avatar": None}
+        mine = [
+            bot_message(m, channel_id, content)
+            for m, content in world.messages.items()
+            if world.message_channels.get(m) == channel_id
+        ]
+        return sorted([starter, *mine], key=lambda m: int(m["id"]), reverse=True)
+
     monkeypatch.setattr(bot.http, "send_message", send_message)
     monkeypatch.setattr(bot.http, "edit_message", edit_message)
     monkeypatch.setattr(bot.http, "delete_message", delete_message)
+    monkeypatch.setattr(bot.http, "logs_from", logs_from)
     monkeypatch.setattr(bot.http, "get_public_archived_threads", archived_threads)
     monkeypatch.setattr(bot.http, "get_channel", get_channel)
     monkeypatch.setattr(bot.http, "edit_channel", edit_channel)
