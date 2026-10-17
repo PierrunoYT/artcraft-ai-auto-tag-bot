@@ -47,6 +47,7 @@ class Config:
     # Action journal (IDs and timestamps only) for resuming runs, catching up after
     # downtime, and undoing the bot's changes.
     state_db_path: str = "artcraft_state.db"
+    # Days to keep journal entries; 0 keeps them until the operator deletes them.
     action_retention_days: int = 90
     # Handle posts created while the bot was offline when it starts.
     catch_up: bool = True
@@ -146,10 +147,12 @@ class Config:
             raise ValueError("STATE_DB_PATH must be nonempty")
         try:
             retention = int(os.getenv("ACTION_RETENTION_DAYS", "90"))
-            if not 1 <= retention <= 3650:
+            if not 0 <= retention <= 3650:
                 raise ValueError
         except ValueError:
-            raise ValueError("ACTION_RETENTION_DAYS must be an integer from 1 to 3650") from None
+            raise ValueError(
+                "ACTION_RETENTION_DAYS must be an integer from 0 (keep forever) to 3650"
+            ) from None
         catch_up = os.getenv("CATCH_UP", "on").strip().lower()
         if catch_up not in ("on", "off"):
             raise ValueError("CATCH_UP must be 'on' or 'off'")

@@ -1,5 +1,6 @@
 import asyncio
 import contextlib
+import dataclasses
 import datetime
 from copy import deepcopy
 from types import SimpleNamespace
@@ -161,6 +162,30 @@ async def test_old_journal_entries_are_purged(world):
     assert journal.actions(include_undone=True) == []
 
 
+async def test_retention_zero_keeps_the_journal_forever(world):
+    journal = world.bot.journal
+    journal.record("tags", 200, before=[], after=[11])
+    old = stamp(now() - datetime.timedelta(days=5000))
+    journal.db.execute("UPDATE actions SET at = ?", (old,))
+    journal.db.commit()
+    world.bot.config = dataclasses.replace(world.bot.config, action_retention_days=0)
+    assert world.bot.recovery.purge_old() == 0
+    assert len(journal.actions(include_undone=True)) == 1
+
+
+def test_retention_zero_is_a_valid_setting(monkeypatch):
+    from artcraft.config import Config
+
+    for key, setting in {
+        "DISCORD_TOKEN": "t",
+        "OPENROUTER_API_KEY": "k",
+        "FORUM_CHANNEL_IDS": "100",
+        "ACTION_RETENTION_DAYS": "0",
+    }.items():
+        monkeypatch.setenv(key, setting)
+    assert Config.from_env().action_retention_days == 0
+
+
 async def test_history_lists_runs_and_thread_actions(world, interaction):
     run = await tag_thread(world, interaction)
     group = world.bot.tree.get_command("history")
@@ -188,7 +213,7 @@ async def test_history_commands_are_moderator_only(world, interaction):
 
 @pytest.mark.parametrize(
     ("name", "value"),
-    [("STATE_DB_PATH", " "), ("ACTION_RETENTION_DAYS", "0"), ("CATCH_UP", "maybe")],
+    [("STATE_DB_PATH", " "), ("ACTION_RETENTION_DAYS", "-1"), ("CATCH_UP", "maybe")],
 )
 def test_invalid_recovery_settings_fail(monkeypatch, name, value):
     from artcraft.config import Config

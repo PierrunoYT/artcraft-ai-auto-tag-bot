@@ -94,7 +94,9 @@ which post IDs were processed), each change the bot made (post ID, the tag IDs
 before and after, duplicate links added, and the message IDs of its notices), the
 IDs of new posts it has handled, and when it was last online. It contains no titles,
 message text, or author information. Journal entries are deleted automatically
-after a retention period set by the operator (90 days by default).
+after a retention period set by the operator (90 days by default). An operator may
+instead keep them without a time limit; they are then kept until the operator
+deletes them, and deletion requests are still handled as described below.
 
 Operational logs record each action with a timestamp and may include thread and
 forum IDs, the user IDs of people who run or are refused moderator commands, tag

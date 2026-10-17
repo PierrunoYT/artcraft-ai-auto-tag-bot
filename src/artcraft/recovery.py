@@ -33,13 +33,22 @@ class Recovery:
     def mark_seen(self) -> None:
         self.bot.journal.set_state("last_seen", stamp(now()))
 
+    def purge_old(self) -> int:
+        """Delete journal entries past the retention period (none when it is 0)."""
+        days = self.bot.config.action_retention_days
+        if not days:
+            log.info("Journal: retention unlimited; nothing is deleted automatically")
+            return 0
+        removed = self.bot.journal.purge(days)
+        if removed:
+            log.info("Journal: removed %d entries older than %d days", removed, days)
+        return removed
+
     async def start(self) -> None:
         """Run once after connecting: purge old journal entries, resume interrupted
         runs, catch up on missed posts, then record uptime every minute."""
         journal = self.bot.journal
-        removed = journal.purge(self.bot.config.action_retention_days)
-        if removed:
-            log.info("Journal: removed %d entries older than the retention period", removed)
+        self.purge_old()
         last_seen = journal.get_state("last_seen")  # Read before the heartbeat moves it.
         await self.resume_runs()
         if self.bot.config.catch_up:

@@ -84,7 +84,7 @@ and use URLs for your own deployment. See also the official
 | `DUPLICATE_CROSS_LINK` | No | `on` (every post in a group lists the others), `active` (skip archived posts), or `off` (new post only) |
 | `DUPLICATE_SCOPE` | No | `all` (compare posts across every forum in `FORUM_CHANNEL_IDS`) or `forum` (only within the same forum) |
 | `STATE_DB_PATH` | No | `artcraft_state.db`; SQLite action journal used for resume, catch-up, and undo |
-| `ACTION_RETENTION_DAYS` | No | `90`, from 1 to 3650; journal entries older than this are deleted |
+| `ACTION_RETENTION_DAYS` | No | `90`, from 0 to 3650; journal entries older than this are deleted; `0` keeps them forever |
 | `CATCH_UP` | No | `on` (default) or `off`; handle posts created while the bot was offline |
 | `INDEX_CONCURRENCY` | No | `10`, from 1 to 20; posts indexed at the same time |
 | `EMBEDDING_MODEL` | No | `openai/text-embedding-3-small`; must have a ZDR endpoint |
@@ -312,8 +312,11 @@ titles or message text) so it can recover from restarts and undo its own changes
   updates or deletes the affected related-posts notices. Each undo is itself
   recorded as a run.
 
-Journal entries older than `ACTION_RETENTION_DAYS` are deleted on startup. Keep
-`artcraft_state.db` with the bot when moving it to another server.
+Journal entries older than `ACTION_RETENTION_DAYS` are deleted on startup. With
+`ACTION_RETENTION_DAYS=0` nothing is deleted automatically, so runs stay undoable
+indefinitely; the operator remains responsible for deleting data that is no longer
+needed or that a user asks to have removed, as Discord's Developer Terms require.
+Keep `artcraft_state.db` with the bot when moving it to another server.
 
 ## Privacy and retagging boundaries
 
