@@ -132,21 +132,57 @@ async def test_reopening_restores_the_index_and_a_wrong_key_fails(world, duplica
     world.bot.duplicates = None  # Already closed; skip teardown close.
 
 
-@pytest.mark.parametrize("event", ["thread", "starter", "bulk"])
-async def test_deletions_on_discord_remove_stored_data(world, duplicates, event):
-    await index(world, duplicates, 200)
-    if event == "thread":
-        await world.bot.on_raw_thread_delete(SimpleNamespace(thread_id=200))
-    elif event == "starter":
+def stored_rows(duplicates):
+    db = sqlite3.connect(duplicates.config.duplicate_db_path)
+    count = db.execute("SELECT COUNT(*) FROM posts").fetchone()[0]
+    db.close()
+    return count
+
+
+async def delete_starter(world, event):
+    world.deleted_starters.add(200)
+    if event == "starter":
         await world.bot.on_raw_message_delete(SimpleNamespace(message_id=200, channel_id=200))
     else:
         await world.bot.on_raw_bulk_message_delete(
             SimpleNamespace(message_ids={200, 555}, channel_id=200)
         )
+
+
+async def test_thread_deletion_removes_stored_data(world, duplicates):
+    await index(world, duplicates, 200)
+    await world.bot.on_raw_thread_delete(SimpleNamespace(thread_id=200))
     assert 200 not in duplicates.index
-    db = sqlite3.connect(duplicates.config.duplicate_db_path)
-    assert db.execute("SELECT COUNT(*) FROM posts").fetchone() == (0,)
-    db.close()
+    assert stored_rows(duplicates) == 0
+
+
+@pytest.mark.parametrize("event", ["starter", "bulk"])
+async def test_starter_deletion_replaces_the_entry_with_a_title_only_one(world, duplicates, event):
+    world.vectors = {"My digital painting": [1.0, 0.0, 0.0]}
+    await index(world, duplicates, 200)
+    await delete_starter(world, event)
+    assert world.embeddings[-1]["input"] == "My digital painting"  # No deleted text.
+    assert 200 in duplicates.index
+    assert stored_rows(duplicates) == 1
+
+
+@pytest.mark.parametrize("event", ["starter", "bulk"])
+async def test_starter_deletion_with_a_short_title_removes_the_entry(world, duplicates, event):
+    world.channels[200]["name"] = "Bug report"
+    await index(world, duplicates, 200)
+    calls = len(world.embeddings)
+    await delete_starter(world, event)
+    assert len(world.embeddings) == calls
+    assert 200 not in duplicates.index
+    assert stored_rows(duplicates) == 0
+
+
+async def test_failed_reindex_after_starter_deletion_removes_the_entry(world, duplicates):
+    await index(world, duplicates, 200)
+    world.embedding_status = 503
+    await delete_starter(world, "starter")
+    assert 200 not in duplicates.index
+    assert stored_rows(duplicates) == 0
 
 
 async def test_reply_deletion_does_not_remove_the_post(world, duplicates):
@@ -267,9 +303,23 @@ async def test_embedding_failures_are_logged_safely(world, duplicates, caplog):
     assert world.sent == []
 
 
-async def test_new_post_without_a_starter_is_not_indexed(world, duplicates, monkeypatch):
-    monkeypatch.setattr(duplicates_module, "NEW_POST_RETRY_DELAYS", (0, 0))
+async def test_new_post_without_a_starter_and_a_short_title_is_not_indexed(
+    world, duplicates, no_retry_wait
+):
+    world.channels[200]["name"] = "Bug"
     world.deleted_starters.add(200)
     await duplicates.check_new_post(await world.bot.fetch_channel(200))
     assert world.embeddings == []
     assert 200 not in duplicates.index
+
+
+async def test_post_with_a_deleted_starter_is_indexed_from_its_title(world, duplicates):
+    world.deleted_starters.add(200)
+    assert await index(world, duplicates, 200) == "indexed"
+    assert world.embeddings[-1]["input"] == "My digital painting"
+
+
+async def test_new_post_waits_for_a_lagging_starter(world, duplicates, no_retry_wait):
+    world.lagging_starters[200] = 2  # Readable on the third attempt.
+    await duplicates.check_new_post(await world.bot.fetch_channel(200))
+    assert world.embeddings[-1]["input"].startswith("My digital painting\n\nA digital")

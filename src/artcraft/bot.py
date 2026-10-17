@@ -88,7 +88,7 @@ class ArtCraftBot(discord.Client):
 
     async def tag_new_post(self, thread: discord.Thread) -> None:
         try:
-            await self.tagger.tag(thread.id)
+            await self.tagger.tag(thread.id, new_post=True)
         except (ClassificationError, discord.HTTPException) as exc:
             log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
 
@@ -107,24 +107,38 @@ class ArtCraftBot(discord.Client):
 
     async def on_raw_message_delete(self, payload: discord.RawMessageDeleteEvent) -> None:
         if payload.message_id == payload.channel_id:  # A forum post's starter message.
-            self.forget_deleted(payload.channel_id)
+            await self.reindex_starter_change(payload.channel_id, "deleted")
 
     async def on_raw_bulk_message_delete(self, payload: discord.RawBulkMessageDeleteEvent) -> None:
         if payload.channel_id in payload.message_ids:
-            self.forget_deleted(payload.channel_id)
+            await self.reindex_starter_change(payload.channel_id, "deleted")
 
     async def on_raw_message_edit(self, payload: discord.RawMessageUpdateEvent) -> None:
-        if not self.duplicates or payload.message_id != payload.channel_id:
-            return
-        if payload.channel_id not in self.duplicates.index:
+        if payload.message_id == payload.channel_id:
+            await self.reindex_starter_change(payload.channel_id, "edited")
+
+    async def reindex_starter_change(self, thread_id: int, change: str) -> None:
+        """Re-embed an indexed post after its starter changed. A deleted starter
+        leaves a title-only entry, or none if the title is too short."""
+        if not self.duplicates or thread_id not in self.duplicates.index:
             return
         try:
-            thread = await self.fetch_channel(payload.channel_id)
-            if isinstance(thread, discord.Thread):
-                await self.duplicates.index_post(thread, refresh=True)
-                log.info("Thread %s re-indexed after its starter was edited", thread.id)
-        except (EmbeddingError, discord.HTTPException) as exc:
-            log.warning("Thread %s re-index failed (%s)", payload.channel_id, type(exc).__name__)
+            thread = await self.fetch_channel(thread_id)
+            if not isinstance(thread, discord.Thread):
+                raise TypeError
+            status = await self.duplicates.index_post(thread, refresh=True)
+            log.info(
+                "Thread %s re-indexed after its starter was %s (%s)", thread_id, change, status
+            )
+        except (EmbeddingError, discord.HTTPException, TypeError) as exc:
+            # Never keep a vector derived from content that may be gone or changed.
+            self.duplicates.index.remove(thread_id)
+            log.warning(
+                "Thread %s removed from the duplicate index; re-index after starter %s failed (%s)",
+                thread_id,
+                change,
+                type(exc).__name__,
+            )
 
     async def on_error(self, event_method: str, *args, **kwargs) -> None:
         # Log the traceback for debugging, but never the event arguments, which

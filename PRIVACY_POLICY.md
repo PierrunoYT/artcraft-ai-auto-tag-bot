@@ -35,8 +35,9 @@ also sent to OpenRouter to compute an embedding (a list of numbers representing 
 post's meaning). The purpose is to point authors of new posts to similar earlier
 posts. Embeddings are compared only with posts in the same forum.
 
-The bot does not intentionally include replies, attachment contents, embeds, or
-linked-page contents in classification or embeddings. Discord API responses can contain extra
+If a post's starter message has been deleted, only the title is used. The bot does
+not intentionally include replies, attachment contents, embeds, or linked-page
+contents in classification or embeddings. Discord API responses can contain extra
 message metadata, which may be present transiently in process memory. The bot does
 not download attachments or browse links.
 
@@ -70,9 +71,11 @@ If duplicate detection is enabled, the bot stores, for each indexed post: the po
 (thread) ID, the forum ID, the embedding model name, and the post's embedding,
 encrypted at rest. It does not store titles, message text, usernames, or author IDs.
 The post ID links an entry to the Discord post, so this data is pseudonymous, not
-anonymous, and is treated as personal data. An entry is deleted when the post or its
-starter message is deleted on Discord, when its forum is removed from the bot's
-configuration, or on request. Editing a starter message replaces its entry. Entries
+anonymous, and is treated as personal data. An entry is deleted when the post is
+deleted on Discord, when its forum is removed from the bot's configuration, or on
+request. When only the starter message is deleted, the entry is replaced by one
+computed from the post's title, which remains visible on Discord, or deleted if the
+title is too short. Editing a starter message replaces its entry. Entries
 are otherwise kept while the post exists and duplicate detection stays enabled. The
 data is used only for duplicate detection; it is not shared, sold, or used to train
 AI models.

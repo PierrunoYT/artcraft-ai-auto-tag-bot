@@ -216,3 +216,42 @@ async def test_replace_mode_logs_removed_tag_names(world, replace_mode, caplog):
     with caplog.at_level(logging.INFO):
         await world.bot.tagger.tag(200)
     assert "Retagged: +Painting, +Digital, -Critique." in caplog.text
+
+
+async def test_deleted_starter_is_classified_from_a_descriptive_title(world, caplog):
+    world.deleted_starters.add(200)
+    with caplog.at_level(logging.INFO):
+        result = await world.bot.tagger.tag(200)
+    prompt = json.loads(world.requests[0]["messages"][1]["content"])
+    assert (prompt["title"], prompt["body"]) == ("My digital painting", "")
+    assert result.status == "updated"
+    assert "from the title only (starter message deleted)" in result.reason
+    assert "title only" in caplog.text
+
+
+async def test_deleted_starter_with_a_short_title_is_skipped(world):
+    world.channels[200]["name"] = "Bug"
+    world.deleted_starters.add(200)
+    result = await world.bot.tagger.tag(200)
+    assert result.status == "skipped"
+    assert "title is too short" in result.reason
+    assert world.requests == [] and world.writes == []
+
+
+async def test_old_posts_do_not_wait_for_a_missing_starter(world, monkeypatch):
+    sleeps = []
+    monkeypatch.setattr(asyncio, "sleep", lambda delay: sleeps.append(delay) or real_sleep(0))
+    world.deleted_starters.add(200)
+    await world.bot.tagger.tag(200)
+    assert sleeps.count(1) == 0  # No retry delays for existing posts.
+
+
+async def test_new_post_waits_for_a_lagging_starter_before_classifying(world, no_retry_wait):
+    world.lagging_starters[200] = 3  # Readable on the fourth attempt.
+    await world.bot.on_thread_create(await world.bot.fetch_channel(200))
+    prompt = json.loads(world.requests[0]["messages"][1]["content"])
+    assert prompt["body"] == "A digital landscape, feedback welcome."
+    assert world.channels[200]["applied_tags"] == ["14", "11", "12"]
+
+
+real_sleep = asyncio.sleep

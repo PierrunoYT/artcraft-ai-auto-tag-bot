@@ -7,6 +7,7 @@ from typing import Literal
 
 import discord
 
+from . import posts
 from .classifier import Classifier
 from .config import Config
 
@@ -50,13 +51,15 @@ class Tagger:
             if not users[0]:
                 del self._thread_locks[thread_id]
 
-    async def tag(self, thread_id: int, include_archived: bool = False) -> TagResult:
-        result = await self._tag(thread_id, include_archived)
+    async def tag(
+        self, thread_id: int, include_archived: bool = False, new_post: bool = False
+    ) -> TagResult:
+        result = await self._tag(thread_id, include_archived, new_post)
         # Reasons hold only tag names and status text, never post content.
         log.info("Thread %s %s: %s", thread_id, result.status, result.reason)
         return result
 
-    async def _tag(self, thread_id: int, include_archived: bool) -> TagResult:
+    async def _tag(self, thread_id: int, include_archived: bool, new_post: bool) -> TagResult:
         # Take the thread lock first so a waiting duplicate does not hold a slot.
         async with self._thread_lock(thread_id), self.slots:
             thread = await self.client.fetch_channel(thread_id)
@@ -90,17 +93,14 @@ class Tagger:
             }
             if not candidates:
                 return skipped("No forum tags are available to members.")
-            # The starter can briefly lag THREAD_CREATE. Never substitute a reply
-            # if the starter has been deleted or is unavailable.
-            for attempt in range(3):
-                try:
-                    starter = await thread.fetch_message(thread.id)
-                    break
-                except discord.NotFound:
-                    if attempt == 2:
-                        return skipped("Starter message is unavailable.")
-                    await asyncio.sleep(1)
-            suggestions = await self.classifier.classify(thread.name, starter.content, candidates)
+            # Only new posts wait for a lagging starter; an old post's missing starter
+            # was deleted. Without it, fall back to the title, never to replies.
+            text = await posts.starter_text(thread, posts.NEW_POST_RETRY_DELAYS if new_post else ())
+            if text is None and not posts.title_is_usable(thread.name):
+                return skipped(
+                    "Starter message is unavailable and the title is too short to classify."
+                )
+            suggestions = await self.classifier.classify(thread.name, text or "", candidates)
 
             # Re-read after AI latency; do not apply a classification that includes
             # deleted tags, or change a thread that has since been locked/archived.
@@ -148,4 +148,5 @@ class Tagger:
             names = {tag.id: tag.name for tag in forum.available_tags}
             changes = [f"+{names.get(t, t)}" for t in final if t not in existing]
             changes += [f"-{names.get(t, t)}" for t in existing if t not in final]
-            return TagResult("updated", f"Retagged: {', '.join(changes)}.", added, removed)
+            source = " from the title only (starter message deleted)" if text is None else ""
+            return TagResult("updated", f"Retagged{source}: {', '.join(changes)}.", added, removed)

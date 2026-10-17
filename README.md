@@ -159,7 +159,14 @@ Locked threads are never changed. Archived threads are changed only by
 Classification uses
 the title and up to 6,000 characters of the **starter message**, not replies,
 attachment contents, embeds, or linked pages. An image-only post is classified
-from its title. Missing starter messages are skipped after brief retries.
+from its title.
+
+If a post's starter message was deleted (Discord shows "Original message was
+deleted"), the bot uses the post's title alone, which stays visible on Discord. Titles
+under three words ("Bug", "Question") say too little, so those posts are skipped.
+Replies are never used instead. New posts first retry for about 15 seconds, because
+Discord can make a new starter readable a few seconds after the post appears; older
+posts are not retried.
 
 Only member-selectable tags are offered to the model. Moderator-only tags are
 never applied by the bot, so post text cannot talk the model into setting one, and
@@ -206,8 +213,11 @@ the index. Update your Privacy Policy and tell members before enabling it.
   the embedding vector, encrypted with `DUPLICATE_DB_KEY`. No titles, text,
   usernames, or author IDs. Embeddings are derived from post text, so treat the file
   as personal data.
-- **Kept in sync:** deleting a post or its starter message on Discord deletes its
-  entry; editing the starter re-indexes it. On startup, entries for forums no longer
+- **Kept in sync:** deleting a post on Discord deletes its entry. Deleting its
+  starter message replaces the entry with one computed from the title alone (or
+  deletes it if the title is under three words), so no stored vector reflects
+  deleted text. Editing the starter re-indexes it; if re-indexing fails, the entry
+  is deleted. On startup, entries for forums no longer
   in `FORUM_CHANNEL_IDS` and vectors from a different `EMBEDDING_MODEL` are deleted.
   `/duplicates forget` handles deletion requests. Title edits are picked up only when a
   post is re-indexed. Deletions that happen while the bot is offline are not seen.

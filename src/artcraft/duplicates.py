@@ -16,12 +16,10 @@ import discord
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 
+from . import posts
 from .config import Config
 
 log = logging.getLogger(__name__)
-
-# The starter can lag THREAD_CREATE by several seconds; back off before giving up.
-NEW_POST_RETRY_DELAYS = (1, 2, 4, 8)
 
 
 class EmbeddingError(Exception):
@@ -195,21 +193,23 @@ class DuplicateFinder:
     async def _embed_post(
         self, thread: discord.Thread, retry_delays: Sequence[float] = ()
     ) -> array | None:
-        for delay in (*retry_delays, None):
-            try:
-                starter = await thread.fetch_message(thread.id)
-                break
-            except discord.NotFound:
-                if delay is None:
-                    log.info("Thread %s not indexed: starter message is unavailable", thread.id)
-                    return None
-                await asyncio.sleep(delay)
+        title = thread.name[:256]
+        text = await posts.starter_text(thread, retry_delays)
+        if text is None:
+            # The starter was deleted; the title is still public on Discord.
+            if not posts.title_is_usable(title):
+                log.info("Thread %s not indexed: no starter and the title is too short", thread.id)
+                return None
+            log.info("Thread %s indexed from the title only (starter deleted)", thread.id)
+            content = title
+        else:
+            content = f"{title}\n\n{text[:6000]}"
         async with self.slots:
-            return await self.embedder.embed(f"{thread.name[:256]}\n\n{starter.content[:6000]}")
+            return await self.embedder.embed(content)
 
     async def index_post(self, thread: discord.Thread, refresh: bool = False) -> str:
         """Embed and store a post; returns "indexed", "unchanged" (already indexed),
-        or "skipped" (unconfigured forum, excluded, or no starter message)."""
+        or "skipped" (unconfigured forum, excluded, or nothing usable to embed)."""
         if thread.parent_id not in self.config.forum_channel_ids:
             return "skipped"
         if thread.id in self.index.excluded:
@@ -217,7 +217,11 @@ class DuplicateFinder:
         if thread.id in self.index and not refresh:
             return "unchanged"
         vector = await self._embed_post(thread)
-        if vector is None or not self.index.add(thread.id, thread.parent_id, vector):
+        if vector is None:
+            # Never keep a vector derived from content that is gone.
+            self.index.remove(thread.id)
+            return "skipped"
+        if not self.index.add(thread.id, thread.parent_id, vector):
             return "skipped"
         return "indexed"
 
@@ -233,7 +237,7 @@ class DuplicateFinder:
             return []
         if thread.id in self.index.excluded:
             return []
-        vector = await self._embed_post(thread, NEW_POST_RETRY_DELAYS)
+        vector = await self._embed_post(thread, posts.NEW_POST_RETRY_DELAYS)
         if vector is None:
             return []
         found = await self.matches(

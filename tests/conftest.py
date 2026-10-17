@@ -10,6 +10,7 @@ import httpx
 import pytest
 from cryptography.fernet import Fernet
 
+from artcraft import posts
 from artcraft.bot import ArtCraftBot
 from artcraft.config import Config
 from artcraft.duplicates import DuplicateFinder, DuplicateIndex, Embedder
@@ -112,6 +113,7 @@ async def world(monkeypatch):
         vectors={},  # Post title -> embedding returned by the fake model.
         sent=[],  # (channel_id, payload) for messages the bot sends.
         deleted_starters=set(),
+        lagging_starters={},  # Thread ID -> fetches that 404 before the starter appears.
     )
 
     async def get_channel(channel_id):
@@ -131,7 +133,10 @@ async def world(monkeypatch):
 
     async def get_message(channel_id, message_id):
         assert channel_id == message_id  # Only the starter, never replies.
-        if channel_id in world.deleted_starters:
+        lagging = world.lagging_starters.get(channel_id, 0)  # Not yet readable.
+        if lagging:
+            world.lagging_starters[channel_id] = lagging - 1
+        if channel_id in world.deleted_starters or lagging:
             raise discord.NotFound(SimpleNamespace(status=404, reason="Not Found"), "")
         return {
             "id": str(message_id),
@@ -248,6 +253,12 @@ def duplicates(world, tmp_path):
         asyncio.Semaphore(config.index_concurrency),
     )
     return world.bot.duplicates
+
+
+@pytest.fixture
+def no_retry_wait(monkeypatch):
+    """Keep new-post starter retries but without real sleeps."""
+    monkeypatch.setattr(posts, "NEW_POST_RETRY_DELAYS", (0, 0, 0, 0))
 
 
 @pytest.fixture
