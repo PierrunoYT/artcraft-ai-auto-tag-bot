@@ -248,6 +248,8 @@ class Match:
     title: str
     score: float  # Embedding similarity, used to shortlist candidates.
     confirmed: bool  # Whether the AI check judged it a real duplicate.
+    archived: bool = False  # Live state when known; replying revives an archived post.
+    locked: bool = False
 
 
 def post_link(guild_id: int, match: Match) -> str:
@@ -257,7 +259,9 @@ def post_link(guild_id: int, match: Match) -> str:
     return f"[{title}](https://discord.com/channels/{guild_id}/{match.thread_id})"
 
 
-MAX_NOTICE_LINKS = 10
+# Posts whose live titles are fetched per notice; the rest are counted as "more".
+MAX_NOTICE_LINKS = 40
+NOTICE_LIMIT = 2000  # Discord's message length limit.
 
 
 class CrossLinker:
@@ -277,18 +281,23 @@ class CrossLinker:
         self.journal = journal
         self._locks: dict[int, asyncio.Lock] = {}
 
-    def relate(self, group: list[int]) -> None:
-        """Relate posts and journal the newly added pairs so an undo can remove them."""
-        new = self.index.relate(group)
+    def relate(self, group: list[int]) -> list[int]:
+        """Relate posts, merging in every existing group they belong to, so all
+        members of the merged group are related to each other. Journals the newly
+        added pairs so an undo can remove them; returns the merged group."""
+        merged = list(dict.fromkeys(group))
+        for thread_id in group:
+            merged += [t for t in self.index.related(thread_id) if t not in merged]
+        new = self.index.relate(merged)
         if new and self.journal:
             self.journal.record("relate", group[0], after=new)
+        return merged
 
     async def link(self, new_id: int, duplicate_ids: list[int]) -> None:
-        """Relate a new post to its confirmed duplicates (and them to each other),
-        then update the notices."""
-        group = [new_id, *duplicate_ids]
-        self.relate(group)
-        targets = group if self.config.duplicate_cross_link != "off" else [new_id]
+        """Relate a new post to its confirmed duplicates and the groups they already
+        belong to, then update every member's notice."""
+        merged = self.relate([new_id, *duplicate_ids])
+        targets = merged if self.config.duplicate_cross_link != "off" else [new_id]
         for thread_id in targets:
             await self.refresh(thread_id)
 
@@ -324,20 +333,29 @@ class CrossLinker:
                 self.index.drop_notice(thread_id)
                 self.index.remove(thread_id)
                 continue
-            found.append(Match(thread_id, other.name, 0.0, True))
+            found.append(Match(thread_id, other.name, 0.0, True, other.archived, other.locked))
         return found
 
-    def _content(self, guild_id: int, related: list[Match]) -> str | None:
+    def _content(self, guild_id: int, related: list[Match], unfetched: int = 0) -> str | None:
+        """The notice text: as many links as fit in one Discord message (newest
+        first), then "…and N more"."""
         if not related:
             return None
-        shown = related[:MAX_NOTICE_LINKS]
-        lines = "\n".join(f"• {post_link(guild_id, m)}" for m in shown)
-        more = len(related) - len(shown)
-        extra = f"\n…and {more} more." if more else ""
-        return (
-            f"🔁 Related posts (found automatically):\n{lines}{extra}\n\n"
-            "If one of these covers the same request, consider continuing there."
+        header = "🔁 Related posts (found automatically):\n"
+        footer = (
+            "\n\nIf one of these covers the same request, please continue there instead "
+            "of starting a new post. Archived posts come back when you reply in them."
         )
+        budget = NOTICE_LIMIT - len(header) - len(footer) - len("\n…and 9999 more.")
+        lines: list[str] = []
+        for match in related:
+            line = f"• {post_link(guild_id, match)}{state_note(match)}"
+            if sum(len(x) + 1 for x in lines) + len(line) > budget:
+                break
+            lines.append(line)
+        more = len(related) - len(lines) + max(unfetched, 0)
+        extra = f"\n…and {more} more." if more else ""
+        return header + "\n".join(lines) + extra + footer
 
     async def _refresh(self, thread_id: int) -> bool:
         """Create, edit, or delete a post's notice; True if the post no longer exists."""
@@ -356,7 +374,10 @@ class CrossLinker:
         if forum is None or not forum.permissions_for(thread.guild.me).send_messages_in_threads:
             log.warning("Thread %s: missing Send Messages in Threads; no notice", thread_id)
             return False
-        content = self._content(thread.guild.id, await self._titles(self.index.related(thread_id)))
+        related = self.index.related(thread_id)
+        # Titles are read live; very large groups only fetch the newest posts.
+        shown = await self._titles(related[:MAX_NOTICE_LINKS])
+        content = self._content(thread.guild.id, shown, len(related) - MAX_NOTICE_LINKS)
         if content is None and message_id is None:
             return False
         reopened = thread.archived
@@ -401,6 +422,15 @@ class CrossLinker:
         # Message IDs only; the notice text (which shows post titles) is not stored.
         if self.journal:
             self.journal.record(kind, thread_id, message_id=message_id)
+
+
+def state_note(match: Match) -> str:
+    """Tell members which linked posts can be revived by replying."""
+    if match.locked:
+        return " (locked)"
+    if match.archived:
+        return " (archived – reply there to bring it back)"
+    return ""
 
 
 class DuplicateFinder:

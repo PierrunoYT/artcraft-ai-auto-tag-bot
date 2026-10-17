@@ -65,11 +65,13 @@ async def test_a_later_duplicate_edits_existing_notices_instead_of_posting(world
     world.vectors["Mail client with multiple accounts"] = [1.0, 0.01, 0.0]
     world.judge = ["201"]  # Confirmed only against the Apple Mail request.
     await world.bot.on_thread_create(await world.bot.fetch_channel(203))
-    # One new notice (in 203); 201's existing notice was edited, not reposted.
+    # One new notice (in 203); existing notices were edited, not reposted.
     assert [channel for channel, _ in world.sent[sent_before:]] == [203]
-    assert any(channel == 201 for channel, _, _ in world.edited)
-    assert linked(world, duplicates, 201) == {200, 202, 203}
-    assert linked(world, duplicates, 203) == {201}
+    assert {channel for channel, _, _ in world.edited} == {200, 201, 202}
+    # 203 joined the whole group, not just the post it matched.
+    assert linked(world, duplicates, 203) == {200, 201, 202}
+    for member, others in {200: {201, 202, 203}, 201: {200, 202, 203}}.items():
+        assert linked(world, duplicates, member) == others
 
 
 async def test_archived_posts_are_reopened_briefly_and_archived_again(world, duplicates):
@@ -334,3 +336,65 @@ def test_scope_setting_is_configurable(monkeypatch, value):
     }.items():
         monkeypatch.setenv(name, setting)
     assert Config.from_env().duplicate_scope == value
+
+
+async def test_notice_tells_authors_to_revive_archived_posts(world, duplicates):
+    await mail_group(world, duplicates, archived=True)  # 201 is archived.
+    content = notice(world, duplicates, 200)
+    assert (
+        f"[Apple Mail replacement]({LINK}201) (archived – reply there to bring it back)" in content
+    )
+    assert f"[EmailCraft]({LINK}202)\n" in content or f"[EmailCraft]({LINK}202)" in content
+    assert "(archived" not in content.split(f"{LINK}202)")[1].split("\n")[0]
+    assert "please continue there instead of starting a new post" in content
+    assert "Archived posts come back when you reply in them." in content
+
+
+async def test_notice_marks_locked_posts_as_not_revivable(world, duplicates):
+    await mail_group(world, duplicates, locked=True)  # 201 is locked.
+    content = notice(world, duplicates, 200)
+    assert f"[Apple Mail replacement]({LINK}201) (locked)" in content
+    assert "reply there to bring it back" not in content
+
+
+async def test_link_all_merges_overlapping_matches_into_one_group(world, duplicates, interaction):
+    # 200~201 and 201~202 (but not 200~202): one merged FL Studio group.
+    world.channels[200]["name"] = "FL Studio like app next"
+    add_thread(world, 201, "BeatsCraft FL Studio Clone")
+    add_thread(world, 202, "FL STUDIO FOR LINUX")
+    # Similarity 200~201 ≈ 0.70, 201~202 ≈ 0.88, but 200~202 ≈ 0.30 (below the
+    # 0.45 floor), so 200 and 202 only end up together through merging.
+    world.vectors = {
+        "FL Studio like app next": [1.0, 0.0, 0.0],
+        "BeatsCraft FL Studio Clone": [0.7, 0.71, 0.0],
+        "FL STUDIO FOR LINUX": [0.3, 0.95, 0.0],
+    }
+    for thread_id in (200, 201, 202):
+        await index(world, duplicates, thread_id)
+    summary = await run_link_all(world, interaction, "post")
+    assert "Cross-linked 1 group(s) covering 3 posts" in summary
+    for member, others in {200: {201, 202}, 201: {200, 202}, 202: {200, 201}}.items():
+        assert linked(world, duplicates, member) == others
+
+
+async def test_link_command_joins_an_existing_group(world, duplicates, interaction):
+    await indexed_mail_posts(world, duplicates)
+    duplicates.links.relate([201, 202])  # An existing group of two.
+    world.judge = ["201"]  # Post 200 only matches 201 directly.
+    group = world.bot.tree.get_command("duplicates")
+    await group.link.callback(group, interaction)
+    assert linked(world, duplicates, 200) == {201, 202}
+    assert linked(world, duplicates, 202) == {200, 201}
+
+
+async def test_big_groups_fit_in_one_discord_message(world, duplicates):
+    ids = list(range(300, 350))
+    for thread_id in ids:
+        add_thread(world, thread_id, f"FL Studio request with a fairly long title {thread_id}")
+    duplicates.links.relate([200, *ids])
+    await duplicates.links.refresh(200)
+    content = notice(world, duplicates, 200)
+    assert len(content) <= 2000
+    shown = len(linked(world, duplicates, 200))
+    assert f"…and {50 - shown} more." in content
+    assert linked(world, duplicates, 200) <= set(ids[::-1][:shown])  # Newest first.

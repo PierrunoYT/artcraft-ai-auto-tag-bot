@@ -946,11 +946,14 @@ class DuplicateCommands(
                     for cluster in clusters
                 )
                 return f"{head} Found {len(clusters)} group(s) covering {covered} posts:\n{shown}"
-            for group in groups:
-                finder.links.relate(group)  # Journaled, so the run can be undone.
+            # Link each merged group as a whole (joining any existing groups its posts
+            # are in); journaled, so the run can be undone.
+            affected: set[int] = set()
+            for cluster in clusters:
+                affected.update(finder.links.relate(cluster))
             failed = 0
             # Each post's notice is written once, after all groups are known.
-            for thread_id in sorted({t for c in clusters for t in c}, reverse=True):
+            for thread_id in sorted(affected, reverse=True):
                 try:
                     await finder.links.refresh(thread_id)
                 except discord.HTTPException as exc:

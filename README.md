@@ -239,8 +239,16 @@ the index. Update your Privacy Policy and tell members before enabling it.
   exists are dropped and removed from the index. This costs one AI call per new post
   with candidates, about $0.0005.
 - **Cross-linking:** every post in a group gets one "🔁 Related posts" message from
-  the bot listing all the others with their live titles, newest first (up to 10,
-  then "…and N more"). When the group grows, the bot **edits** its existing
+  the bot listing all the others with their live titles, newest first, as many as
+  fit in one Discord message, then "…and N more". **Groups merge:** a post that
+  matches any member of an existing group joins the whole group, so all posts about
+  the same thing (for example every FL Studio request) share one list, and every
+  member's message is updated. `/duplicates link_all` likewise links whole merged
+  groups. Archived posts are marked "(archived – reply there to bring
+  it back)" and locked ones "(locked)", and the message asks authors to continue in
+  an existing post instead of starting a new one; replying in an archived post
+  reopens it. These marks reflect each post's state when the message was last
+  written or updated. When the group grows, the bot **edits** its existing
   message instead of posting again, so older posts are not spammed. Archived posts
   are unarchived, updated, and archived again; posting a post's first notice
   bumps it once in "recent activity", later edits do not. Locked posts are never
