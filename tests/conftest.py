@@ -107,6 +107,8 @@ async def world(monkeypatch):
         max_in_flight=0,
         embeddings=[],  # Embedding request payloads.
         embedding_status=200,
+        embed_in_flight=0,
+        max_embed_in_flight=0,
         vectors={},  # Post title -> embedding returned by the fake model.
         sent=[],  # (channel_id, payload) for messages the bot sends.
         deleted_starters=set(),
@@ -186,6 +188,10 @@ async def world(monkeypatch):
         payload = json.loads(request.content)
         if request.url.path.endswith("/embeddings"):
             world.embeddings.append(payload)
+            world.embed_in_flight += 1
+            world.max_embed_in_flight = max(world.max_embed_in_flight, world.embed_in_flight)
+            await asyncio.sleep(0)  # Permit overlap like a real network call.
+            world.embed_in_flight -= 1
             title = payload["input"].split("\n\n")[0]
             vector = world.vectors.get(title, [0.0, 1.0, 0.0])
             return httpx.Response(
@@ -239,7 +245,7 @@ def duplicates(world, tmp_path):
         Embedder(world.bot.http_client, "fake-key", config.embedding_model),
         DuplicateIndex(config.duplicate_db_path, DB_KEY, config.embedding_model),
         config,
-        world.bot.tagger.slots,
+        asyncio.Semaphore(config.index_concurrency),
     )
     return world.bot.duplicates
 

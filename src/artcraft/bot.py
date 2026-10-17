@@ -47,7 +47,7 @@ class ArtCraftBot(discord.Client):
                     config.duplicate_db_path, config.duplicate_db_key, config.embedding_model
                 ),
                 config,
-                self.tagger.slots,
+                asyncio.Semaphore(config.index_concurrency),
             )
         self.tree = app_commands.CommandTree(self)
         self.tree.add_command(TagCommands(self))
@@ -245,6 +245,7 @@ class ModeratorGroup(app_commands.Group):
         threads: list[discord.Thread],
         handle: Callable[[discord.Thread], Awaitable[str]],
         counts: dict[str, int],
+        workers: int,
         should_stop: Callable[[], bool] = lambda: False,
         progress: str | None = None,
     ) -> None:
@@ -266,7 +267,7 @@ class ModeratorGroup(app_commands.Group):
                     log.info("%s: %d/%d done", progress, done, len(threads))
 
         async with asyncio.TaskGroup() as group:
-            for _ in range(self.bot.config.tag_concurrency):
+            for _ in range(workers):
                 group.create_task(worker())
 
     async def start_full_run(
@@ -277,6 +278,7 @@ class ModeratorGroup(app_commands.Group):
         handle: Callable[[discord.Thread], Awaitable[str]],
         verb: str,
         statuses: tuple[str, ...],
+        workers: int,
     ) -> None:
         """Start a background run over every post in a forum, newest first."""
         self.running_batches.add(forum.id)
@@ -291,7 +293,7 @@ class ModeratorGroup(app_commands.Group):
         threads = sorted(active + archived, key=lambda thread: thread.id, reverse=True)
         self.stop_requests.discard(forum.id)
         self.full_runs[forum.id] = asyncio.create_task(
-            self.run_full(interaction, forum, threads, handle, verb, statuses)
+            self.run_full(interaction, forum, threads, handle, verb, statuses, workers)
         )
         log.info(
             "Full %s run on forum %s started: %d posts (%d active, %d archived)",
@@ -304,7 +306,7 @@ class ModeratorGroup(app_commands.Group):
         await interaction.followup.send(
             f"Started {verb} {len(threads)} posts ({len(active)} active, "
             f"{len(archived)} archived), newest first, "
-            f"{self.bot.config.tag_concurrency} at a time. New posts are still "
+            f"{workers} at a time. New posts are still "
             "handled meanwhile. I'll send the summary when done (by DM if it takes over "
             f"15 minutes). Use `/{self.name} stop` to cancel.",
             ephemeral=True,
@@ -318,6 +320,7 @@ class ModeratorGroup(app_commands.Group):
         handle: Callable[[discord.Thread], Awaitable[str]],
         verb: str,
         statuses: tuple[str, ...],
+        workers: int,
     ) -> None:
         counts = new_counts(statuses)
         try:
@@ -325,6 +328,7 @@ class ModeratorGroup(app_commands.Group):
                 threads,
                 handle,
                 counts,
+                workers,
                 should_stop=lambda: forum.id in self.stop_requests,
                 progress=f"Full {verb} run on forum {forum.id}",
             )
@@ -439,7 +443,7 @@ class TagCommands(ModeratorGroup, name="autotag", description="AI forum tagging 
                 )
                 available = len(eligible)
                 selected = eligible[:limit]
-                await self.run_workers(selected, self.tag, counts)
+                await self.run_workers(selected, self.tag, counts, self.bot.config.tag_concurrency)
         except TimeoutError:
             timed_out = True
         finally:
@@ -492,7 +496,13 @@ class TagCommands(ModeratorGroup, name="autotag", description="AI forum tagging 
             return await self.tag(thread, include_archived)
 
         await self.start_full_run(
-            interaction, forum, include_archived, handle, "tagging", TAG_STATUSES
+            interaction,
+            forum,
+            include_archived,
+            handle,
+            "tagging",
+            TAG_STATUSES,
+            self.bot.config.tag_concurrency,
         )
 
     @app_commands.command(name="stop", description="Stop a running /autotag all for a forum")
@@ -543,7 +553,13 @@ class DuplicateCommands(
         # Includes locked posts and forums without tags; already indexed posts are
         # skipped, so re-runs only embed new posts. Full runs never reply in posts.
         await self.start_full_run(
-            interaction, forum, include_archived, finder.index_post, "indexing", INDEX_STATUSES
+            interaction,
+            forum,
+            include_archived,
+            finder.index_post,
+            "indexing",
+            INDEX_STATUSES,
+            self.bot.config.index_concurrency,
         )
 
     @app_commands.command(name="stop", description="Stop a running /duplicates index for a forum")

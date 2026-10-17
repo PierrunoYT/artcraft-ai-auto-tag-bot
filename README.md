@@ -80,6 +80,7 @@ and use URLs for your own deployment. See also the official
 | `DUPLICATE_DB_PATH` | No | `duplicates.db`; SQLite file for the encrypted index |
 | `DUPLICATE_THRESHOLD` | No | `0.7`, from 0.5 to 0.99; minimum similarity for a reply |
 | `DUPLICATE_MAX_MATCHES` | No | `5`, from 1 to 10; most similar posts linked in a reply |
+| `INDEX_CONCURRENCY` | No | `10`, from 1 to 20; posts indexed at the same time |
 | `EMBEDDING_MODEL` | No | `openai/text-embedding-3-small`; must have a ZDR endpoint |
 
 The default model is served through a ZDR endpoint with structured outputs.
@@ -131,7 +132,7 @@ These reply "Duplicate detection is off" unless `DUPLICATES=on`.
 
 - **`/duplicates index forum:<forum> [include_archived:True]`** — index every post
   in the forum for duplicate detection, in the background like `/autotag all`, with
-  no tagging. Includes locked posts and forums without tags. Already indexed posts
+  no tagging, `INDEX_CONCURRENCY` posts at a time. Includes locked posts and forums without tags. Already indexed posts
   are skipped, so re-running only embeds new posts. Never replies in posts.
 - **`/duplicates stop forum:<forum>`** — stop a running `/duplicates index`.
 - **`/duplicates similar [thread_id] [limit:10]`** — list up to 25 of the most
@@ -141,7 +142,11 @@ These reply "Duplicate detection is off" unless `DUPLICATES=on`.
   never index it again, for example on a member's deletion request.
 
 Each group allows one batch or full run per forum at a time; a tagging run and an
-indexing run can run side by side, sharing the `TAG_CONCURRENCY` slots. Each examined post costs one
+indexing run can run side by side. Tagging uses `TAG_CONCURRENCY` (default 4) and
+indexing uses `INDEX_CONCURRENCY` (default 10), because embeddings are much faster
+and cheaper than classification: indexing handles about 13 posts per second, so
+2,750 posts take roughly 3½ minutes.
+
 Each examined post costs one AI call. Tagging one post takes about 8 seconds, so
 with the default of 4 in parallel,
 1,000 posts take roughly 35 minutes. Raising `TAG_CONCURRENCY` speeds up full runs

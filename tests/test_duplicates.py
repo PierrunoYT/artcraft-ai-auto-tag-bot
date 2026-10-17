@@ -188,6 +188,21 @@ async def test_index_run_indexes_locked_posts_once_without_tagging(world, duplic
     assert world.sent == []  # Index runs never reply in posts.
 
 
+async def test_index_run_uses_its_own_higher_concurrency(world, duplicates, interaction):
+    for thread_id in range(201, 215):
+        add_thread(world, thread_id, f"Post {thread_id}")
+    group = world.bot.tree.get_command("duplicates")
+    await group.index.callback(group, interaction, world.guild.get_channel(100))
+    assert (
+        "15 posts (15 active, 0 archived), newest first, 10 at a time"
+        in (interaction.followup.send.call_args.args[0])
+    )
+    await group.full_runs[100]
+    assert world.bot.config.tag_concurrency == 4
+    assert world.max_embed_in_flight == world.bot.config.index_concurrency == 10
+    assert len(duplicates.index) == 15
+
+
 async def test_index_run_can_be_stopped(world, duplicates, interaction):
     group = world.bot.tree.get_command("duplicates")
     await group.index.callback(group, interaction, world.guild.get_channel(100))

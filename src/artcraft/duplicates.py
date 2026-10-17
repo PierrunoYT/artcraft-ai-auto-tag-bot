@@ -189,7 +189,7 @@ class DuplicateFinder:
         self.embedder = embedder
         self.index = index
         self.config = config
-        # Shared with the tagger so both respect TAG_CONCURRENCY.
+        # Caps concurrent embedding requests (INDEX_CONCURRENCY), separately from tagging.
         self.slots = slots
 
     async def _embed_post(

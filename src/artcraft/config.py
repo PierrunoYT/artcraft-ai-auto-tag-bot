@@ -33,6 +33,9 @@ class Config:
     duplicate_threshold: float = 0.7
     # Most similar posts linked in a reply.
     duplicate_max_matches: int = 5
+    # Posts indexed at the same time; embeddings are cheap and fast, so this is
+    # separate from (and higher than) TAG_CONCURRENCY.
+    index_concurrency: int = 10
 
     @classmethod
     def from_env(cls) -> Config:
@@ -106,6 +109,12 @@ class Config:
                 raise ValueError
         except ValueError:
             raise ValueError("DUPLICATE_MAX_MATCHES must be an integer from 1 to 10") from None
+        try:
+            index_concurrency = int(os.getenv("INDEX_CONCURRENCY", "10"))
+            if not 1 <= index_concurrency <= 20:
+                raise ValueError
+        except ValueError:
+            raise ValueError("INDEX_CONCURRENCY must be an integer from 1 to 20") from None
 
         return cls(
             discord_token=token,
@@ -122,4 +131,5 @@ class Config:
             embedding_model=embedding_model,
             duplicate_threshold=threshold,
             duplicate_max_matches=max_matches,
+            index_concurrency=index_concurrency,
         )

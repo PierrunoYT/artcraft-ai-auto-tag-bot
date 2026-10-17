@@ -18,6 +18,7 @@ def config_env(monkeypatch):
         monkeypatch.delenv(name, raising=False)
     monkeypatch.delenv("DUPLICATE_THRESHOLD", raising=False)
     monkeypatch.delenv("DUPLICATE_MAX_MATCHES", raising=False)
+    monkeypatch.delenv("INDEX_CONCURRENCY", raising=False)
 
 
 def test_defaults_and_secrets_are_not_in_repr():
@@ -31,6 +32,7 @@ def test_defaults_and_secrets_are_not_in_repr():
     assert config.duplicates is False
     assert config.duplicate_threshold == 0.7
     assert config.duplicate_max_matches == 5
+    assert config.index_concurrency == 10
     assert config.embedding_model == "openai/text-embedding-3-small"
     assert "private" not in repr(config)
 
@@ -60,6 +62,8 @@ def test_defaults_and_secrets_are_not_in_repr():
         ("DUPLICATE_DB_PATH", " "),
         ("DUPLICATE_MAX_MATCHES", "0"),
         ("DUPLICATE_MAX_MATCHES", "11"),
+        ("INDEX_CONCURRENCY", "0"),
+        ("INDEX_CONCURRENCY", "21"),
     ],
 )
 def test_invalid_config_fails_before_connecting(monkeypatch, name, value):
