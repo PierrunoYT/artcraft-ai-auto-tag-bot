@@ -10,6 +10,7 @@ import discord
 from . import posts
 from .classifier import Classifier
 from .config import Config
+from .journal import Journal
 
 log = logging.getLogger(__name__)
 
@@ -30,10 +31,17 @@ def skipped(reason: str) -> TagResult:
 
 
 class Tagger:
-    def __init__(self, client: discord.Client, classifier: Classifier, config: Config):
+    def __init__(
+        self,
+        client: discord.Client,
+        classifier: Classifier,
+        config: Config,
+        journal: Journal | None = None,
+    ):
         self.client = client
         self.classifier = classifier
         self.config = config
+        self.journal = journal
         # Caps posts in flight (and concurrent API spend) across events and batches.
         self.slots = asyncio.Semaphore(config.tag_concurrency)
         # Per-thread locks so duplicate events never retag the same post twice at once.
@@ -133,20 +141,48 @@ class Tagger:
                 return skipped("Forum requires a tag; the empty selection was not applied.")
             # Discord has no conditional write; edits by others during classification
             # can be overwritten.
-            applied_tags = [discord.Object(tag_id) for tag_id in final]
-            reason = f"ArtCraft AI tagging ({self.config.tag_mode})"
-            if fresh.archived:
-                # Discord only edits unarchived threads: unarchive in the same request,
-                # then archive again so the post keeps its state.
-                await fresh.edit(archived=False, applied_tags=applied_tags, reason=reason)
-                try:
-                    await fresh.edit(archived=True, reason=f"{reason}; restore archive")
-                except discord.HTTPException:
-                    log.warning("Thread %s was retagged but could not be re-archived", fresh.id)
-            else:
-                await fresh.edit(applied_tags=applied_tags, reason=reason)
+            await self._apply(
+                fresh, existing, final, f"ArtCraft AI tagging ({self.config.tag_mode})"
+            )
             names = {tag.id: tag.name for tag in forum.available_tags}
             changes = [f"+{names.get(t, t)}" for t in final if t not in existing]
             changes += [f"-{names.get(t, t)}" for t in existing if t not in final]
             source = " from the title only (starter message deleted)" if text is None else ""
             return TagResult("updated", f"Retagged{source}: {', '.join(changes)}.", added, removed)
+
+    async def _apply(
+        self, thread: discord.Thread, before: list[int], tags: list[int], reason: str
+    ) -> None:
+        """Write a post's tags and journal the change so it can be undone."""
+        applied_tags = [discord.Object(tag_id) for tag_id in tags]
+        if thread.archived:
+            # Discord only edits unarchived threads: unarchive in the same request,
+            # then archive again so the post keeps its state.
+            await thread.edit(archived=False, applied_tags=applied_tags, reason=reason)
+            try:
+                await thread.edit(archived=True, reason=f"{reason}; restore archive")
+            except discord.HTTPException:
+                log.warning("Thread %s was retagged but could not be re-archived", thread.id)
+        else:
+            await thread.edit(applied_tags=applied_tags, reason=reason)
+        if self.journal:
+            self.journal.record("tags", thread.id, before=list(before), after=list(tags))
+
+    async def set_tags(self, thread_id: int, expected: list[int], tags: list[int]) -> str:
+        """Restore a post's tags for an undo, only if they still equal `expected` (what
+        the bot left); never overwrites later manual edits. Returns "undone",
+        "unchanged", "conflict" (changed since), or "skipped" (gone or locked)."""
+        async with self._thread_lock(thread_id), self.slots:
+            try:
+                thread = await self.client.fetch_channel(thread_id)
+            except discord.NotFound:
+                return "skipped"
+            if not isinstance(thread, discord.Thread) or thread.locked:
+                return "skipped"
+            current = list(thread._applied_tags)
+            if set(current) == set(tags):
+                return "unchanged"
+            if set(current) != set(expected):
+                return "conflict"
+            await self._apply(thread, current, tags, "ArtCraft undo")
+            return "undone"

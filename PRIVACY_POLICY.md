@@ -87,6 +87,15 @@ are otherwise kept while the post exists and duplicate detection stays enabled. 
 data is used only for duplicate detection; it is not shared, sold, or used to train
 AI models.
 
+To resume interrupted work, handle posts created while it was offline, and undo its
+own changes, the bot keeps an action journal. It records the bot's runs (type, forum
+ID, options, the user ID of the moderator who started it, start and end times, and
+which post IDs were processed), each change the bot made (post ID, the tag IDs
+before and after, duplicate links added, and the message IDs of its notices), the
+IDs of new posts it has handled, and when it was last online. It contains no titles,
+message text, or author information. Journal entries are deleted automatically
+after a retention period set by the operator (90 days by default).
+
 Operational logs record each action with a timestamp and may include thread and
 forum IDs, the user IDs of people who run or are refused moderator commands, tag
 names added or removed, connection status, action counts, error types, and stack

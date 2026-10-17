@@ -44,6 +44,12 @@ class Config:
     # Posts indexed at the same time; embeddings are cheap and fast, so this is
     # separate from (and higher than) TAG_CONCURRENCY.
     index_concurrency: int = 10
+    # Action journal (IDs and timestamps only) for resuming runs, catching up after
+    # downtime, and undoing the bot's changes.
+    state_db_path: str = "artcraft_state.db"
+    action_retention_days: int = 90
+    # Handle posts created while the bot was offline when it starts.
+    catch_up: bool = True
 
     @classmethod
     def from_env(cls) -> Config:
@@ -135,6 +141,18 @@ class Config:
                 raise ValueError
         except ValueError:
             raise ValueError("INDEX_CONCURRENCY must be an integer from 1 to 20") from None
+        state_db_path = os.getenv("STATE_DB_PATH", "artcraft_state.db").strip()
+        if not state_db_path:
+            raise ValueError("STATE_DB_PATH must be nonempty")
+        try:
+            retention = int(os.getenv("ACTION_RETENTION_DAYS", "90"))
+            if not 1 <= retention <= 3650:
+                raise ValueError
+        except ValueError:
+            raise ValueError("ACTION_RETENTION_DAYS must be an integer from 1 to 3650") from None
+        catch_up = os.getenv("CATCH_UP", "on").strip().lower()
+        if catch_up not in ("on", "off"):
+            raise ValueError("CATCH_UP must be 'on' or 'off'")
 
         return cls(
             discord_token=token,
@@ -155,4 +173,7 @@ class Config:
             duplicate_cross_link=cross_link,
             duplicate_scope=scope,
             index_concurrency=index_concurrency,
+            state_db_path=state_db_path,
+            action_retention_days=retention,
+            catch_up=catch_up == "on",
         )

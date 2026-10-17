@@ -20,6 +20,7 @@ from cryptography.fernet import Fernet, InvalidToken
 from . import posts
 from .classifier import DuplicateJudge
 from .config import Config
+from .journal import Journal
 
 log = logging.getLogger(__name__)
 
@@ -181,10 +182,20 @@ class DuplicateIndex:
             self.drop_notice(thread_id)
         return len(stale)
 
-    def relate(self, thread_ids: Sequence[int]) -> None:
-        """Mark every listed post as related to every other one."""
+    def relate(self, thread_ids: Sequence[int]) -> list[tuple[int, int]]:
+        """Mark every listed post as related to every other one; returns the pairs
+        that were not related before (what an undo should remove)."""
         pairs = [(a, b) for a in thread_ids for b in thread_ids if a != b]
-        self.db.executemany("INSERT OR IGNORE INTO related VALUES (?, ?)", pairs)
+        query = "SELECT 1 FROM related WHERE thread_id = ? AND related_id = ?"
+        new = [p for p in pairs if self.db.execute(query, p).fetchone() is None]
+        self.db.executemany("INSERT OR IGNORE INTO related VALUES (?, ?)", new)
+        self.db.commit()
+        return new
+
+    def unrelate_pairs(self, pairs: Sequence[Sequence[int]]) -> None:
+        self.db.executemany(
+            "DELETE FROM related WHERE thread_id = ? AND related_id = ?", [tuple(p) for p in pairs]
+        )
         self.db.commit()
 
     def related(self, thread_id: int) -> list[int]:
@@ -253,17 +264,30 @@ class CrossLinker:
     """Keeps one "Related posts" message in each cross-linked post, listing all the
     others, and edits it as the group changes so old posts are not spammed."""
 
-    def __init__(self, client: discord.Client, index: DuplicateIndex, config: Config):
+    def __init__(
+        self,
+        client: discord.Client,
+        index: DuplicateIndex,
+        config: Config,
+        journal: Journal | None = None,
+    ):
         self.client = client
         self.index = index
         self.config = config
+        self.journal = journal
         self._locks: dict[int, asyncio.Lock] = {}
+
+    def relate(self, group: list[int]) -> None:
+        """Relate posts and journal the newly added pairs so an undo can remove them."""
+        new = self.index.relate(group)
+        if new and self.journal:
+            self.journal.record("relate", group[0], after=new)
 
     async def link(self, new_id: int, duplicate_ids: list[int]) -> None:
         """Relate a new post to its confirmed duplicates (and them to each other),
         then update the notices."""
         group = [new_id, *duplicate_ids]
-        self.index.relate(group)
+        self.relate(group)
         targets = group if self.config.duplicate_cross_link != "off" else [new_id]
         for thread_id in targets:
             await self.refresh(thread_id)
@@ -357,9 +381,11 @@ class CrossLinker:
                 if content is None:
                     await message.delete()
                     self.index.drop_notice(thread.id)
+                    self._record("notice_delete", thread.id, message_id)
                     log.info("Thread %s: related-posts notice removed", thread.id)
                 else:
                     await message.edit(content=content, allowed_mentions=none)
+                    self._record("notice_edit", thread.id, message_id)
                     log.info("Thread %s: related-posts notice updated", thread.id)
             except discord.NotFound:
                 # Deleted by a moderator: remember that and do not post again.
@@ -368,7 +394,13 @@ class CrossLinker:
             return
         sent = await thread.send(content, allowed_mentions=none)
         self.index.set_notice(thread.id, sent.id)
+        self._record("notice_post", thread.id, sent.id)
         log.info("Thread %s: related-posts notice posted", thread.id)
+
+    def _record(self, kind: str, thread_id: int, message_id: int) -> None:
+        # Message IDs only; the notice text (which shows post titles) is not stored.
+        if self.journal:
+            self.journal.record(kind, thread_id, message_id=message_id)
 
 
 class DuplicateFinder:
@@ -380,6 +412,7 @@ class DuplicateFinder:
         config: Config,
         slots: asyncio.Semaphore,
         judge: DuplicateJudge,
+        journal: Journal | None = None,
     ):
         self.client = client
         self.embedder = embedder
@@ -388,7 +421,7 @@ class DuplicateFinder:
         # Caps concurrent embedding requests (INDEX_CONCURRENCY), separately from tagging.
         self.slots = slots
         self.judge = judge
-        self.links = CrossLinker(client, index, config)
+        self.links = CrossLinker(client, index, config, journal)
 
     async def _read_post(
         self, thread: discord.Thread, retry_delays: Sequence[float] = ()

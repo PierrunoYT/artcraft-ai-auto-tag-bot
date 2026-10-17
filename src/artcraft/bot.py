@@ -1,7 +1,10 @@
 import asyncio
+import contextlib
+import datetime
 import logging
-from collections.abc import Awaitable, Callable
-from typing import Literal
+from collections.abc import Awaitable, Callable, Iterator
+from dataclasses import dataclass
+from typing import Any, Literal
 
 import discord
 import httpx
@@ -17,6 +20,8 @@ from .duplicates import (
     Match,
     post_link,
 )
+from .journal import Action, Journal, Run, current_run, now
+from .recovery import Recovery
 from .tagging import Tagger
 
 log = logging.getLogger(__name__)
@@ -30,6 +35,18 @@ def new_counts(keys: tuple[str, ...] = TAG_STATUSES) -> dict[str, int]:
     return dict.fromkeys(keys, 0)
 
 
+@dataclass
+class Job:
+    """What a background forum run does with each post."""
+
+    verb: str
+    statuses: tuple[str, ...]
+    workers: int
+    handle: Callable[[discord.Thread], Awaitable[str | tuple[str, Any]]]
+    # Runs after the posts (given whether the run was stopped); returns summary text.
+    finish: Callable[[bool], Awaitable[str]] | None = None
+
+
 class ArtCraftBot(discord.Client):
     def __init__(self, config: Config):
         intents = discord.Intents.none()
@@ -40,12 +57,14 @@ class ArtCraftBot(discord.Client):
         super().__init__(intents=intents, max_messages=None)
         self.config = config
         self.http_client = httpx.AsyncClient()
+        self.journal = Journal(config.state_db_path)
         self.tagger = Tagger(
             self,
             Classifier(
                 self.http_client, config.openrouter_api_key, config.model, config.max_ai_tags
             ),
             config,
+            self.journal,
         )
         self.duplicates: DuplicateFinder | None = None
         if config.duplicates:
@@ -58,11 +77,17 @@ class ArtCraftBot(discord.Client):
                 config,
                 asyncio.Semaphore(config.index_concurrency),
                 DuplicateJudge(self.http_client, config.openrouter_api_key, config.model),
+                self.journal,
             )
         self.tree = app_commands.CommandTree(self)
-        self.tree.add_command(TagCommands(self))
-        self.tree.add_command(DuplicateCommands(self))
+        self.tag_commands = TagCommands(self)
+        self.duplicate_commands = DuplicateCommands(self)
+        self.tree.add_command(self.tag_commands)
+        self.tree.add_command(self.duplicate_commands)
+        self.tree.add_command(HistoryCommands(self))
         self.tree.on_error = self.command_error
+        self.recovery = Recovery(self)
+        self._recovery_task: asyncio.Task | None = None
 
     async def setup_hook(self) -> None:
         if self.duplicates:
@@ -76,25 +101,37 @@ class ArtCraftBot(discord.Client):
 
     async def close(self) -> None:
         try:
+            if self._recovery_task:
+                self._recovery_task.cancel()
+            self.recovery.mark_seen()  # Catch-up starts from here next time.
             await super().close()
         finally:
             await self.http_client.aclose()
             if self.duplicates:
                 self.duplicates.index.close()
+            self.journal.close()
 
     async def on_ready(self) -> None:
         log.info("ArtCraft connected; %d forum(s) configured", len(self.config.forum_channel_ids))
+        # on_ready repeats after reconnects; recover only once per process.
+        if self._recovery_task is None:
+            self._recovery_task = asyncio.create_task(self.recovery.start())
 
     async def on_thread_create(self, thread: discord.Thread) -> None:
         if thread.parent_id not in self.config.forum_channel_ids:
             return
         log.info("New post %s in forum %s", thread.id, thread.parent_id)
+        await self.process_new_post(thread)
+
+    async def process_new_post(self, thread: discord.Thread) -> None:
+        """Tag and duplicate-check a new post, then remember it was handled."""
         # Tagging and duplicate checks are independent: neither waits for nor
         # depends on the other's success.
         jobs = [self.tag_new_post(thread)]
         if self.duplicates:
             jobs.append(self.check_new_post_duplicates(thread))
         await asyncio.gather(*jobs)
+        self.journal.mark_handled(thread.id)
 
     async def tag_new_post(self, thread: discord.Thread) -> None:
         try:
@@ -273,124 +310,168 @@ class ModeratorGroup(app_commands.Group):
     async def run_workers(
         self,
         threads: list[discord.Thread],
-        handle: Callable[[discord.Thread], Awaitable[str]],
+        handle: Callable[[discord.Thread], Awaitable[str | tuple[str, Any]]],
         counts: dict[str, int],
         workers: int,
         should_stop: Callable[[], bool] = lambda: False,
         progress: str | None = None,
+        run_id: int | None = None,
     ) -> None:
         """Run handle over threads with parallel workers, roughly in order, counting
-        each returned status."""
+        each returned status (or (status, data) pair). With a run ID, each finished
+        post is journaled so an interrupted run can resume; failures are not, so a
+        resumed run retries them."""
         pending = iter(threads)  # Shared: each worker takes the next unclaimed thread.
+        total = sum(counts.values()) + len(threads)
 
         async def worker() -> None:
             for thread in pending:
                 if should_stop():
                     return
                 try:
-                    counts[await handle(thread)] += 1
+                    result = await handle(thread)
+                    status, data = result if isinstance(result, tuple) else (result, None)
+                    counts[status] += 1
+                    if run_id is not None:
+                        self.bot.journal.record_item(run_id, thread.id, status, data)
                 except (ClassificationError, EmbeddingError, discord.HTTPException) as exc:
                     counts["failed"] += 1
                     log.warning("Thread %s failed (%s)", thread.id, type(exc).__name__)
                 done = sum(counts.values())
                 if progress and done % 25 == 0:
-                    log.info("%s: %d/%d done", progress, done, len(threads))
+                    log.info("%s: %d/%d done", progress, done, total)
 
         async with asyncio.TaskGroup() as group:
             for _ in range(workers):
                 group.create_task(worker())
 
+    def make_job(self, kind: str, forum: discord.ForumChannel, options: dict, prior: dict) -> "Job":
+        """What a background run of `kind` does with each post; `prior` holds the
+        items an interrupted run already finished."""
+        raise NotImplementedError
+
     async def start_full_run(
         self,
-        interaction: discord.Interaction,
+        interaction: discord.Interaction | None,
         forum: discord.ForumChannel,
-        include_archived: bool,
-        handle: Callable[[discord.Thread], Awaitable[str]],
-        verb: str,
-        statuses: tuple[str, ...],
-        workers: int,
-        finish: Callable[[bool], Awaitable[str]] | None = None,
+        kind: str,
+        options: dict,
+        resume: Run | None = None,
+        user_id: int | None = None,
     ) -> None:
-        """Start a background run over every post in a forum, newest first. `finish`
-        runs after the posts (given whether the run was stopped) and returns text
-        appended to the summary."""
+        """Start (or, after a restart, resume) a journaled background run over every
+        post in a forum, newest first."""
         self.running_batches.add(forum.id)
         try:
             active = [t for t in await forum.guild.active_threads() if t.parent_id == forum.id]
             archived = (
-                [t async for t in forum.archived_threads(limit=None)] if include_archived else []
+                [t async for t in forum.archived_threads(limit=None)]
+                if options.get("include_archived", True)
+                else []
             )
         except BaseException:
             self.running_batches.discard(forum.id)
             raise
         threads = sorted(active + archived, key=lambda thread: thread.id, reverse=True)
+        if resume is None:
+            run_id = self.bot.journal.start_run(kind, forum.id, options, user_id)
+            prior: dict = {}
+        else:
+            run_id, prior = resume.id, self.bot.journal.items(resume.id)
+        job = self.make_job(kind, forum, options, prior)
+        todo = [t for t in threads if t.id not in prior]
         self.stop_requests.discard(forum.id)
         self.full_runs[forum.id] = asyncio.create_task(
-            self.run_full(interaction, forum, threads, handle, verb, statuses, workers, finish)
+            self.run_full(interaction, forum, todo, len(threads), job, run_id, prior, user_id)
         )
         log.info(
-            "Full %s run on forum %s started: %d posts (%d active, %d archived)",
-            verb,
+            "Full %s run #%s on forum %s %s: %d posts (%d active, %d archived), %d to do",
+            job.verb,
+            run_id,
             forum.id,
+            "resumed" if resume else "started",
             len(threads),
             len(active),
             len(archived),
+            len(todo),
         )
-        await interaction.followup.send(
-            f"Started {verb} {len(threads)} posts ({len(active)} active, "
-            f"{len(archived)} archived), newest first, "
-            f"{workers} at a time. New posts are still "
-            "handled meanwhile. I'll send the summary when done (by DM if it takes over "
-            f"15 minutes). Use `/{self.name} stop` to cancel.",
-            ephemeral=True,
-        )
+        if resume is None:
+            text = (
+                f"Started {job.verb} {len(threads)} posts ({len(active)} active, "
+                f"{len(archived)} archived), newest first, {job.workers} at a time. "
+                "New posts are still handled meanwhile. I'll send the summary when done "
+                f"(by DM if it takes over 15 minutes). Use `/{self.name} stop` to cancel. "
+                f"This is run #{run_id}; `/history undo run:{run_id}` can undo it."
+            )
+        else:
+            text = (
+                f"The bot restarted during run #{run_id} ({job.verb} <#{forum.id}>). "
+                f"Resuming: {len(prior)} of {len(threads)} posts were already done; "
+                f"{len(todo)} to go. I'll send the summary when done."
+            )
+        await self.report(interaction, text, user_id)
 
     async def run_full(
         self,
-        interaction: discord.Interaction,
+        interaction: discord.Interaction | None,
         forum: discord.ForumChannel,
         threads: list[discord.Thread],
-        handle: Callable[[discord.Thread], Awaitable[str]],
-        verb: str,
-        statuses: tuple[str, ...],
-        workers: int,
-        finish: Callable[[bool], Awaitable[str]] | None = None,
+        total: int,
+        job: "Job",
+        run_id: int,
+        prior: dict,
+        user_id: int | None,
     ) -> None:
-        counts = new_counts(statuses)
+        counts = new_counts(job.statuses)
+        for status, _ in prior.values():
+            if status in counts:
+                counts[status] += 1
         extra = ""
+        interrupted = False
+        token = current_run.set(run_id)  # Attributes every action to this run.
         try:
             await self.run_workers(
                 threads,
-                handle,
+                job.handle,
                 counts,
-                workers,
+                job.workers,
                 should_stop=lambda: forum.id in self.stop_requests,
-                progress=f"Full {verb} run on forum {forum.id}",
+                progress=f"Full {job.verb} run #{run_id} on forum {forum.id}",
+                run_id=run_id,
             )
             stopped = forum.id in self.stop_requests
-            if finish:
-                extra = " " + await finish(stopped)
+            if job.finish:
+                extra = " " + await job.finish(stopped)
+        except asyncio.CancelledError:
+            # The bot is shutting down: leave the run marked running so it resumes.
+            interrupted = True
+            raise
         finally:
+            current_run.reset(token)
             stopped = forum.id in self.stop_requests
             self.running_batches.discard(forum.id)
             self.stop_requests.discard(forum.id)
             self.full_runs.pop(forum.id, None)
+            if not interrupted:
+                self.bot.journal.finish_run(run_id, "stopped" if stopped else "finished")
         state = "stopped" if stopped else "finished"
         done = sum(counts.values())
-        breakdown = ", ".join(f"{counts[key]} {key}" for key in statuses)
+        breakdown = ", ".join(f"{counts[key]} {key}" for key in job.statuses)
         log.info(
-            "Full %s run on forum %s %s: %d/%d examined, %s",
-            verb,
+            "Full %s run #%s on forum %s %s: %d/%d examined, %s",
+            job.verb,
+            run_id,
             forum.id,
             state,
             done,
-            len(threads),
+            total,
             breakdown,
         )
         await self.report(
             interaction,
-            f"Full {verb} run on <#{forum.id}> {state}. "
-            f"Examined {done}/{len(threads)} posts: {breakdown}.{extra}",
+            f"Full {job.verb} run on <#{forum.id}> {state}. "
+            f"Examined {done}/{total} posts: {breakdown}.{extra}",
+            user_id,
         )
 
     async def request_stop(self, interaction: discord.Interaction, forum) -> None:
@@ -405,19 +486,50 @@ class ModeratorGroup(app_commands.Group):
             "Stopping after the current post; the summary follows.", ephemeral=True
         )
 
-    async def report(self, interaction: discord.Interaction, message: str) -> None:
+    async def report(
+        self,
+        interaction: discord.Interaction | None,
+        message: str,
+        user_id: int | None = None,
+    ) -> None:
+        """Reply to the command, or DM the user once the interaction has expired or
+        when a run resumed after a restart (no interaction)."""
         if len(message) > 2000:  # Discord's message limit.
             message = message[:1990].rsplit("\n", 1)[0] + "\n…"
-        # Interaction follow-ups expire after 15 minutes; fall back to a DM.
-        try:
-            await interaction.followup.send(message, ephemeral=True)
+        if interaction is not None:
+            # Interaction follow-ups expire after 15 minutes; fall back to a DM.
+            try:
+                await interaction.followup.send(message, ephemeral=True)
+                return
+            except discord.HTTPException:
+                pass
+            user, user_id = interaction.user, interaction.user.id
+        elif user_id is None:
+            log.info("No one to notify: %s", message.splitlines()[0])
             return
-        except discord.HTTPException:
-            pass
+        else:
+            try:
+                user = await self.bot.fetch_user(user_id)
+            except discord.HTTPException:
+                log.warning("Could not find user %s to deliver a summary", user_id)
+                return
         try:
-            await interaction.user.send(message)
+            await user.send(message)
         except discord.HTTPException:
-            log.warning("Could not deliver the summary to user %s", interaction.user.id)
+            log.warning("Could not deliver the summary to user %s", user_id)
+
+    @contextlib.contextmanager
+    def journaled_run(self, kind: str, forum_id: int, options: dict, user_id: int) -> Iterator[int]:
+        """Record a single command as a run, so `/history undo run:<id>` can undo it."""
+        run_id = self.bot.journal.start_run(kind, forum_id, options, user_id)
+        token = current_run.set(run_id)
+        status = "failed"
+        try:
+            yield run_id
+            status = "finished"
+        finally:
+            current_run.reset(token)
+            self.bot.journal.finish_run(run_id, status)
 
 
 @app_commands.guild_only()
@@ -438,8 +550,11 @@ class TagCommands(ModeratorGroup, name="autotag", description="AI forum tagging 
             return
         try:
             # Includes waiting for a free slot when other tagging work is running.
-            async with asyncio.timeout(60):
-                result = await self.bot.tagger.tag(target.id)
+            with self.journaled_run(
+                "tag_thread", target.parent_id, {"thread_id": target.id}, interaction.user.id
+            ):
+                async with asyncio.timeout(60):
+                    result = await self.bot.tagger.tag(target.id)
         except TimeoutError:
             log.warning("Thread %s timed out waiting for other tagging work", target.id)
             await interaction.followup.send(
@@ -473,17 +588,20 @@ class TagCommands(ModeratorGroup, name="autotag", description="AI forum tagging 
         available = 0
         timed_out = False
         try:
-            # Discord interaction tokens last 15 minutes; leave time for the summary.
-            async with asyncio.timeout(600):
-                threads = await forum.guild.active_threads()
-                eligible = sorted(
-                    (thread for thread in threads if thread.parent_id == forum.id),
-                    key=lambda thread: thread.id,
-                    reverse=True,
-                )
-                available = len(eligible)
-                selected = eligible[:limit]
-                await self.run_workers(selected, self.tag, counts, self.bot.config.tag_concurrency)
+            with self.journaled_run("tag_active", forum.id, {"limit": limit}, interaction.user.id):
+                # Discord interaction tokens last 15 minutes; leave time for the summary.
+                async with asyncio.timeout(600):
+                    threads = await forum.guild.active_threads()
+                    eligible = sorted(
+                        (thread for thread in threads if thread.parent_id == forum.id),
+                        key=lambda thread: thread.id,
+                        reverse=True,
+                    )
+                    available = len(eligible)
+                    selected = eligible[:limit]
+                    await self.run_workers(
+                        selected, self.tag, counts, self.bot.config.tag_concurrency
+                    )
         except TimeoutError:
             timed_out = True
         finally:
@@ -531,19 +649,21 @@ class TagCommands(ModeratorGroup, name="autotag", description="AI forum tagging 
         )
         if not await self.check_forum(interaction, forum):
             return
+        await self.start_full_run(
+            interaction,
+            forum,
+            "tag_all",
+            {"include_archived": include_archived},
+            user_id=interaction.user.id,
+        )
+
+    def make_job(self, kind: str, forum: discord.ForumChannel, options: dict, prior: dict) -> "Job":
+        include_archived = options.get("include_archived", True)
 
         async def handle(thread: discord.Thread) -> str:
             return await self.tag(thread, include_archived)
 
-        await self.start_full_run(
-            interaction,
-            forum,
-            include_archived,
-            handle,
-            "tagging",
-            TAG_STATUSES,
-            self.bot.config.tag_concurrency,
-        )
+        return Job("tagging", TAG_STATUSES, self.bot.config.tag_concurrency, handle)
 
     @app_commands.command(name="stop", description="Stop a running /autotag all for a forum")
     @app_commands.describe(forum="Forum whose full run should stop")
@@ -595,11 +715,9 @@ class DuplicateCommands(
         await self.start_full_run(
             interaction,
             forum,
-            include_archived,
-            finder.index_post,
-            "indexing",
-            INDEX_STATUSES,
-            self.bot.config.index_concurrency,
+            "index",
+            {"include_archived": include_archived},
+            user_id=interaction.user.id,
         )
 
     @app_commands.command(name="stop", description="Stop a running /duplicates index for a forum")
@@ -710,8 +828,11 @@ class DuplicateCommands(
             await interaction.followup.send("That post is not in an enabled forum.", ephemeral=True)
             return
         try:
-            async with asyncio.timeout(120):
-                found = await finder.link_post(target)
+            with self.journaled_run(
+                "link", target.parent_id, {"thread_id": target.id}, interaction.user.id
+            ):
+                async with asyncio.timeout(120):
+                    found = await finder.link_post(target)
         except TimeoutError:
             await interaction.followup.send("Timed out; try again shortly.", ephemeral=True)
             return
@@ -773,11 +894,27 @@ class DuplicateCommands(
                 ephemeral=True,
             )
             return
+        await self.start_full_run(
+            interaction, forum, "link_all", {"mode": mode}, user_id=interaction.user.id
+        )
+
+    def make_job(self, kind: str, forum: discord.ForumChannel, options: dict, prior: dict) -> "Job":
+        finder = self.bot.duplicates
+        if kind == "index":
+            return Job(
+                "indexing", INDEX_STATUSES, self.bot.config.index_concurrency, finder.index_post
+            )
+        return self.link_job(finder, forum, options["mode"], prior)
+
+    def link_job(
+        self, finder: DuplicateFinder, forum: discord.ForumChannel, mode: str, prior: dict
+    ) -> "Job":
         cache: dict = {}  # Candidate text, in memory for this run only.
         titles: dict[int, str] = {}
-        groups: list[list[int]] = []
+        # Groups found before a restart are journaled with their run items.
+        groups: list[list[int]] = [data for status, data in prior.values() if status == "grouped"]
 
-        async def handle(thread: discord.Thread) -> str:
+        async def handle(thread: discord.Thread) -> str | tuple[str, list[int]]:
             if thread.id not in finder.index:
                 return "skipped"
             found = await finder.find(thread, cache)
@@ -785,8 +922,9 @@ class DuplicateCommands(
                 return "unique"
             titles[thread.id] = thread.name
             titles.update((m.thread_id, m.title) for m in found)
-            groups.append([thread.id, *(m.thread_id for m in found)])
-            return "grouped"
+            group = [thread.id, *(m.thread_id for m in found)]
+            groups.append(group)
+            return "grouped", group
 
         async def finish(stopped: bool) -> str:
             clusters = merge_groups(groups)
@@ -809,7 +947,7 @@ class DuplicateCommands(
                 )
                 return f"{head} Found {len(clusters)} group(s) covering {covered} posts:\n{shown}"
             for group in groups:
-                finder.index.relate(group)
+                finder.links.relate(group)  # Journaled, so the run can be undone.
             failed = 0
             # Each post's notice is written once, after all groups are known.
             for thread_id in sorted({t for c in clusters for t in c}, reverse=True):
@@ -824,16 +962,154 @@ class DuplicateCommands(
                 f"each post's related-posts notice was posted or updated once.{note}"
             )
 
-        await self.start_full_run(
-            interaction,
-            forum,
-            True,
-            handle,
-            "linking",
-            LINK_STATUSES,
-            self.bot.config.index_concurrency,
-            finish,
+        return Job("linking", LINK_STATUSES, self.bot.config.index_concurrency, handle, finish)
+
+
+UNDOABLE = ("tags", "relate", "notice_post")
+
+
+def describe_actions(actions: list[Action]) -> str:
+    counts = {kind: sum(1 for a in actions if a.kind == kind) for kind in UNDOABLE}
+    parts = [
+        f"{counts['tags']} tag change(s)",
+        f"{counts['relate']} duplicate link(s)",
+        f"{counts['notice_post']} posted related-posts notice(s)",
+    ]
+    return ", ".join(p for p in parts if not p.startswith("0 ")) or "nothing"
+
+
+@app_commands.guild_only()
+@app_commands.default_permissions(manage_threads=True)
+class HistoryCommands(
+    ModeratorGroup, name="history", description="Bot action history and undo for moderators"
+):
+    def __init__(self, bot: ArtCraftBot):
+        super().__init__(bot)
+        self.undo_tasks: set[asyncio.Task] = set()
+
+    @app_commands.command(name="runs", description="List the bot's recent runs")
+    @app_commands.describe(limit="How many runs to list (default 10)")
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def runs(
+        self, interaction: discord.Interaction, limit: app_commands.Range[int, 1, 25] = 10
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        journal = self.bot.journal
+        runs = journal.runs(limit)
+        if not runs:
+            await interaction.followup.send("No runs recorded yet.", ephemeral=True)
+            return
+        lines = []
+        for run in runs:
+            items = ", ".join(f"{n} {s}" for s, n in sorted(journal.item_counts(run.id).items()))
+            changes = describe_actions(journal.actions(run_id=run.id))
+            who = f" by <@{run.user_id}>" if run.user_id else ""
+            lines.append(
+                f"**#{run.id}** `{run.kind}` <#{run.forum_id}> · {run.status} · "
+                f"{run.started[:16].replace('T', ' ')} UTC{who} · changes: {changes}"
+                + (f" · posts: {items}" if items else "")
+            )
+        await interaction.followup.send(
+            "\n".join(lines), ephemeral=True, allowed_mentions=discord.AllowedMentions.none()
         )
+
+    @app_commands.command(name="thread", description="Show the bot's recent actions on a post")
+    @app_commands.describe(thread_id="Optional thread ID; defaults to the thread you are in")
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def thread(self, interaction: discord.Interaction, thread_id: str | None = None):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        target_id = await self.parse_thread_id(interaction, thread_id)
+        if target_id is None:
+            return
+        actions = self.bot.journal.actions(thread_id=target_id, include_undone=True, limit=15)
+        if not actions:
+            await interaction.followup.send(
+                "No bot actions recorded for this post.", ephemeral=True
+            )
+            return
+        names = self.tag_names()
+        lines = []
+        for a in actions:
+            if a.kind == "tags":
+                before = ", ".join(names.get(t, str(t)) for t in a.before) or "none"
+                after = ", ".join(names.get(t, str(t)) for t in a.after) or "none"
+                what = f"tags {before} → {after}"
+            elif a.kind == "relate":
+                what = f"linked as a duplicate group ({len(a.after)} link(s))"
+            else:
+                what = a.kind.replace("_", " ").replace("notice", "related-posts notice")
+            run = f"run #{a.run_id}" if a.run_id else "new post"
+            undone = " (undone)" if a.undone else ""
+            lines.append(f"• {a.at[:16].replace('T', ' ')} UTC · {run} · {what}{undone}")
+        await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+    def tag_names(self) -> dict[int, str]:
+        names = {}
+        for forum_id in self.bot.config.forum_channel_ids:
+            forum = self.bot.get_channel(forum_id)
+            for tag in getattr(forum, "available_tags", []):
+                names[tag.id] = tag.name
+        return names
+
+    @app_commands.command(name="undo", description="Undo one run's changes (shows a preview first)")
+    @app_commands.describe(
+        run="Run number from /history runs", confirm="Set to True to actually undo"
+    )
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def undo(self, interaction: discord.Interaction, run: int, confirm: bool = False):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        if self.bot.journal.run(run) is None:
+            await interaction.followup.send(f"There is no run #{run}.", ephemeral=True)
+            return
+        actions = self.bot.journal.actions(run_id=run)
+        await self.undo_actions(interaction, actions, f"run #{run}", confirm)
+
+    @app_commands.command(
+        name="undo_recent",
+        description="Undo all bot changes from the last N minutes (shows a preview first)",
+    )
+    @app_commands.describe(
+        minutes="How far back to undo (1-1440)", confirm="Set to True to actually undo"
+    )
+    @app_commands.checks.has_permissions(manage_threads=True)
+    async def undo_recent(
+        self,
+        interaction: discord.Interaction,
+        minutes: app_commands.Range[int, 1, 1440],
+        confirm: bool = False,
+    ):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        since = now() - datetime.timedelta(minutes=minutes)
+        actions = self.bot.journal.actions(since=since)
+        await self.undo_actions(interaction, actions, f"the last {minutes} minute(s)", confirm)
+
+    async def undo_actions(
+        self, interaction: discord.Interaction, actions: list[Action], label: str, confirm: bool
+    ) -> None:
+        undoable = [a for a in actions if a.kind in UNDOABLE]
+        if not undoable:
+            await interaction.followup.send(f"Nothing to undo for {label}.", ephemeral=True)
+            return
+        summary = describe_actions(undoable)
+        if not confirm:
+            await interaction.followup.send(
+                f"Preview: undoing {label} would revert {summary}. Tags someone changed "
+                "since are left alone. Run again with `confirm:True` to undo.",
+                ephemeral=True,
+            )
+            return
+        log.info("Undo of %s by user %s: %s", label, interaction.user.id, summary)
+        await interaction.followup.send(
+            f"Undoing {label} ({summary}); I'll report when done.", ephemeral=True
+        )
+
+        async def run_undo() -> None:
+            result = await self.bot.recovery.undo(undoable, interaction.user.id, label)
+            await self.report(interaction, f"Undo of {label} finished: {result}")
+
+        task = asyncio.create_task(run_undo())
+        self.undo_tasks.add(task)
+        task.add_done_callback(self.undo_tasks.discard)
 
 
 def merge_groups(groups: list[list[int]]) -> list[list[int]]:

@@ -83,6 +83,9 @@ and use URLs for your own deployment. See also the official
 | `DUPLICATE_MAX_MATCHES` | No | `5`, from 1 to 10; most AI-confirmed duplicates linked in a reply |
 | `DUPLICATE_CROSS_LINK` | No | `on` (every post in a group lists the others), `active` (skip archived posts), or `off` (new post only) |
 | `DUPLICATE_SCOPE` | No | `all` (compare posts across every forum in `FORUM_CHANNEL_IDS`) or `forum` (only within the same forum) |
+| `STATE_DB_PATH` | No | `artcraft_state.db`; SQLite action journal used for resume, catch-up, and undo |
+| `ACTION_RETENTION_DAYS` | No | `90`, from 1 to 3650; journal entries older than this are deleted |
+| `CATCH_UP` | No | `on` (default) or `off`; handle posts created while the bot was offline |
 | `INDEX_CONCURRENCY` | No | `10`, from 1 to 20; posts indexed at the same time |
 | `EMBEDDING_MODEL` | No | `openai/text-embedding-3-small`; must have a ZDR endpoint |
 
@@ -269,6 +272,40 @@ the index. Update your Privacy Policy and tell members before enabling it.
 
 Enabling it also turns on the non-privileged Guild Messages intent so the bot sees
 starter edits and deletions; message content is never cached or logged.
+
+## Recovery and history
+
+The bot keeps an action journal in `STATE_DB_PATH` (IDs and timestamps only, never
+titles or message text) so it can recover from restarts and undo its own changes.
+
+- **Runs:** every command that changes things (`/autotag all`, `active`, `thread`,
+  `/duplicates index`, `link`, `link_all`) is recorded as a numbered run with its
+  options, who started it, and which posts it has finished.
+- **Actions:** every tag change (old and new tag IDs), every duplicate link added,
+  and every related-posts notice posted, edited, or deleted (message IDs).
+- **Resume:** if the bot stops during `/autotag all`, `/duplicates index`, or
+  `/duplicates link_all`, it continues the run after restarting, skipping posts it
+  already finished, and sends the summary to whoever started it by DM. Runs stopped
+  with `/... stop` are not resumed. Short commands that were interrupted are marked
+  interrupted; their changes stay undoable.
+- **Catch-up:** the bot records when it was last online. On startup it handles
+  posts created since then (tagging and duplicate checks) that it has not handled
+  yet, like new posts. The very first start does not catch up.
+- **Undo:** the `/history` commands, for allowed users only:
+  - **`/history runs [limit:10]`** — recent runs with their status and changes.
+  - **`/history thread [thread_id]`** — the bot's recent actions on one post.
+  - **`/history undo run:<id> [confirm:True]`** — undo one run's changes.
+  - **`/history undo_recent minutes:<n> [confirm:True]`** — undo every bot change
+    from the last *n* minutes (up to 24 hours), including new-post tagging.
+
+  Without `confirm:True`, undo only shows what it would revert. Tags are restored
+  only where they still match what the bot left, so later manual edits are never
+  overwritten (reported as "left alone"). Undoing duplicate links removes them and
+  updates or deletes the affected related-posts notices. Each undo is itself
+  recorded as a run.
+
+Journal entries older than `ACTION_RETENTION_DAYS` are deleted on startup. Keep
+`artcraft_state.db` with the bot when moving it to another server.
 
 ## Privacy and retagging boundaries
 

@@ -18,10 +18,16 @@ from artcraft.duplicates import DuplicateFinder, DuplicateIndex, Embedder
 
 
 @pytest.fixture
-async def world(monkeypatch):
+async def world(monkeypatch, tmp_path):
     """Real discord.py models/merging over in-memory Discord and OpenRouter transports."""
     bot = ArtCraftBot(
-        Config("fake-token", "fake-key", frozenset({100}), command_user_ids=frozenset({2}))
+        Config(
+            "fake-token",
+            "fake-key",
+            frozenset({100}),
+            command_user_ids=frozenset({2}),
+            state_db_path=str(tmp_path / "state.db"),
+        )
     )
     bot._connection.user = discord.ClientUser(
         state=bot._connection,
@@ -304,6 +310,7 @@ def duplicates(world, tmp_path):
         config,
         asyncio.Semaphore(config.index_concurrency),
         DuplicateJudge(world.bot.http_client, "fake-key", config.model),
+        world.bot.journal,
     )
     return world.bot.duplicates
 
